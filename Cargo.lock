@@ -862,6 +862,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
+name = "samaritan-adversary"
+version = "0.1.0"
+dependencies = [
+ "samaritan-dsl",
+ "samaritan-exec",
+ "samaritan-kernel",
+ "samaritan-ledger",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "samaritan-agent"
 version = "0.1.0"
 dependencies = [

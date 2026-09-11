@@ -10,8 +10,9 @@ how it is positioned against the Gödel-machine literature.
 
 ## Status
 
-**M3 complete**, and container confinement is in — the prerequisite for the
-adversary. 251 tests green across eleven crates.
+**M3 complete**, plus container confinement and the Deviant. 269 tests green
+across twelve crates. The arms race runs: the adversary throws real attacks at
+the real guards, and the containment index falls only on a genuinely new breach.
 
 Measured, not asserted: the certificate's false-certification rate is **0.022**
 against a bound of 0.05, and level-2 nested search reaches a known optimum in
@@ -26,7 +27,7 @@ RustLMHub — is in [docs/inference.md](docs/inference.md).
 | `samaritan-dsl` | decision language, input provenance, mutation grammar, NRPA policy — done |
 | `samaritan-kernel` | frozen core: routing, admission, utility, compute budget — done |
 | `samaritan-ledger` | hash-chained log, calibration, containment, experiment + frontier metrics — done |
-| `samaritan-adversary` | **The Deviant.** Unleashed coevolving adversary; arena only — not started |
+| `samaritan-adversary` | **The Deviant.** The Warden inverted: attacks the real guards, arena scores by novel landings — done |
 | `samaritan-corpus` | history miner, sealed sandboxes, flake screening, splits, frontier set — done |
 | `samaritan-exec` | confined actions, container isolation, timeouts, oracle runner — done |
 | `samaritan-router` | tier dispatch, approval gating, misgrade detection, autonomy streaks — done |
@@ -79,6 +80,7 @@ crates/
   samaritan-episode/  one task, start to score
   samaritan-search/   nested rollout policy adaptation over meta-levels
   samaritan-cert/     whether a self-modification may be kept
+  samaritan-adversary/ the Deviant, and the arena it is caged in
 scripts/              fetch the weights, tune the split, serve
 config/samaritan.toml local model endpoint + arena settings
 docs/design.md        the design of record
