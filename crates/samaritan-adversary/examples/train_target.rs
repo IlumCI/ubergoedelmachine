@@ -65,7 +65,11 @@ fn main() {
         base_url: base_url.clone(),
         model: "samaritan-playout".into(),
         temperature: 1.0,
-        max_tokens: 2048,
+        // An attack is a small JSON object; a big budget only gives a repetition
+        // loop room to run. A tight cap plus the penalty keeps the ambitious
+        // ones finishing as valid objects instead of overrunning mid-string.
+        max_tokens: 640,
+        repeat_penalty: 1.2,
         constrain: Constrain::Grammar,
         timeout: Duration::from_secs(900),
         max_retries: 1,

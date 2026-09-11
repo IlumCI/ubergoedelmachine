@@ -54,7 +54,11 @@ fn main() {
         base_url: base_url.clone(),
         model: "samaritan-playout".into(),
         temperature: 1.0, // the Anti-Christ is meant to be creative
-        max_tokens: 2048,   // the Anti-Christ writes elaborate payloads; give it room
+        // An attack is a small JSON object. A tight cap plus a repetition
+        // penalty stops the abliterated model looping a clause or a `..\`
+        // segment until it overruns the budget and the JSON will not parse.
+        max_tokens: 640,
+        repeat_penalty: 1.2,
         constrain: Constrain::Grammar,
         timeout: Duration::from_secs(900),
         max_retries: 1,

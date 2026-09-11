@@ -76,6 +76,16 @@ pub struct AgentConfig {
     /// Hard cap on generated tokens. At single-digit tokens per second this
     /// is a wall-clock budget as much as a length limit.
     pub max_tokens: u32,
+    /// llama.cpp's n-gram repetition penalty. `1.0` is off; above it discourages
+    /// repeating recent tokens.
+    ///
+    /// Not cosmetic here. The abliterated adversary, unpenalised, falls into
+    /// repetition loops — the same clause or the same `..\` segment emitted
+    /// hundreds of times — that overrun `max_tokens` mid-string and yield
+    /// unparseable JSON, forcing a fallback. A mild penalty is what lets its
+    /// most ambitious attacks finish as valid objects. Emitted on every request;
+    /// servers that do not implement the key ignore it.
+    pub repeat_penalty: f64,
     pub constrain: Constrain,
     pub timeout: Duration,
     /// Retries when the output will not parse. Zero is correct with
@@ -104,6 +114,7 @@ impl Default for AgentConfig {
             model: "local".into(),
             temperature: 0.7,
             max_tokens: 1024,
+            repeat_penalty: 1.0,
             constrain: Constrain::Grammar,
             timeout: Duration::from_secs(600),
             max_retries: 2,
@@ -361,6 +372,7 @@ impl Agent {
             ],
             "temperature": temperature,
             "max_tokens": self.cfg.max_tokens,
+            "repeat_penalty": self.cfg.repeat_penalty,
             "stream": false,
             "seed": seed,
             // llama.cpp: reuse the cached prefix rather than reprocessing it.
