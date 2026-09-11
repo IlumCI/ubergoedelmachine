@@ -1,0 +1,13 @@
+# QDoRA fine-tuning of the Deviant. Install into a CUDA virtualenv:
+#   python -m venv .venv && .venv\Scripts\activate   (Windows)
+#   pip install -r training/requirements.txt
+#
+# Unsloth pulls a matching torch/triton/bitsandbytes stack for your CUDA. If
+# pip resolution fights you, follow the per-CUDA install line at
+# https://github.com/unslothai/unsloth — it is the authority on the exact wheel.
+unsloth
+trl>=0.9
+peft>=0.11
+datasets>=2.19
+# torch/bitsandbytes/triton come in via unsloth's extras for your CUDA version;
+# pin them there rather than here so the versions stay mutually compatible.

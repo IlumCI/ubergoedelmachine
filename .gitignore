@@ -5,3 +5,10 @@
 
 # Cloned upstream projects read for reference; never built or shipped.
 .research/
+
+# Training: venv, caches, exported datasets, and adapter/merge outputs.
+.venv/
+__pycache__/
+*.jsonl
+/adapters/
+/merged/
