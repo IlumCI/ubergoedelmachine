@@ -66,7 +66,15 @@ fn main() {
 
     let mut deviant = GenerativeDeviant::new(agent, 1.0, std::env::var("SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(66_600), BookAttacker(0));
     let mut arena = Arena::new(ArenaConfig::default());
-    let mut ledger = Ledger::in_memory(Box::new(FixedClock("2026-09-11T00:00:00Z".into()))).unwrap();
+    // Persist the ledger when asked, so the bout can be exported to a training
+    // set afterward; otherwise keep it in memory.
+    let mut ledger = match std::env::var("LEDGER_DB") {
+        Ok(path) => {
+            let _ = std::fs::remove_file(&path);
+            Ledger::open_with_clock(&path, Box::new(FixedClock("2026-09-11T00:00:00Z".into()))).unwrap()
+        }
+        Err(_) => Ledger::in_memory(Box::new(FixedClock("2026-09-11T00:00:00Z".into()))).unwrap(),
+    };
     let t = target();
     let policy = MutationPolicy::new();
     let _ = SeededAttacker::new(BookAttacker(0)); // keep the import honest

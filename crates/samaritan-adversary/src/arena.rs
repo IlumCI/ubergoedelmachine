@@ -29,6 +29,7 @@ use samaritan_ledger::{containment_index, Actor, Event, ExploitClass, Ledger, Le
 use serde::{Deserialize, Serialize};
 
 use crate::attack::{attempt, landing_violation, Attack, Target, Verdict};
+use crate::training::{attempt_training, WeakGuard};
 use crate::{AttackReward, Attacker};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -126,6 +127,34 @@ impl Arena {
         let known: Vec<ExploitClass> = self.breached.iter().copied().collect();
         let attack = attacker.propose(&known, policy);
         let verdict = attempt(&attack, target);
+        self.record(&attack, verdict, ledger)
+    }
+
+    /// Run one round against a target with one guard deliberately weakened.
+    ///
+    /// This is a **training bout**, not a measurement. Its purpose is to
+    /// produce the positive examples an all-repel run cannot — see
+    /// [`crate::training`]. Two obligations come with it, and neither is
+    /// optional:
+    ///
+    /// - Run it on a **throwaway `Arena` and a separate ledger.** The
+    ///   containment index this updates describes a guard with a known hole,
+    ///   so it is meaningless as a statement about Samaritan and must never be
+    ///   mixed into the ledger of a measured Solo/Critic/Adversarial run.
+    /// - A `Landed` here is a **foil**, a label for a fine-tune, not a breach.
+    ///   Only the weakened class can reach the hole; every other class is
+    ///   thrown at the real guard exactly as [`Arena::step`] would.
+    pub fn step_training(
+        &mut self,
+        attacker: &mut dyn Attacker,
+        weak: WeakGuard,
+        target: &Target,
+        policy: &samaritan_dsl::MutationPolicy,
+        ledger: &mut Ledger,
+    ) -> Result<Round, LedgerError> {
+        let known: Vec<ExploitClass> = self.breached.iter().copied().collect();
+        let attack = attacker.propose(&known, policy);
+        let verdict = attempt_training(&attack, weak, target);
         self.record(&attack, verdict, ledger)
     }
 

@@ -34,12 +34,14 @@ pub mod attack;
 pub mod dataset;
 pub mod deviant;
 pub mod repertoire;
+pub mod training;
 
 pub use arena::{Arena, ArenaConfig, Round};
 pub use attack::{Attack, Target, Verdict, attempt, landing_violation};
 pub use dataset::{export, summarise, ExportConfig, TrainingRecord};
 pub use deviant::{DraftAttack, GenerativeDeviant, DRAFT_ATTACK_GBNF};
 pub use repertoire::{SeededAttacker, opening_book};
+pub use training::{attempt_training, WeakGuard};
 
 use samaritan_dsl::{ActionKind, BlastRadius, MutationPolicy, Reversibility};
 

@@ -359,7 +359,7 @@ pub fn attempt(attack: &Attack, target: &Target) -> Verdict {
 /// Computed independently of `Admission` rather than by asking it. Using the
 /// component under test to grade the test is how a red team ends up agreeing
 /// with itself.
-fn touches_frozen(diff: &str) -> bool {
+pub(crate) fn touches_frozen(diff: &str) -> bool {
     for line in diff.lines() {
         let Some(rest) = line
             .strip_prefix("--- ")
