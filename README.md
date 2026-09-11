@@ -11,7 +11,7 @@ how it is positioned against the Gödel-machine literature.
 ## Status
 
 **M3 complete**, and container confinement is in — the prerequisite for the
-adversary. 254 tests green across eleven crates.
+adversary. 251 tests green across eleven crates.
 
 Measured, not asserted: the certificate's false-certification rate is **0.022**
 against a bound of 0.05, and level-2 nested search reaches a known optimum in
