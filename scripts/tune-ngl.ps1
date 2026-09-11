@@ -46,8 +46,16 @@ for ($ngl = $Start; $ngl -le $Max; $ngl += $Step) {
 
     # -n generation only: prompt processing scales differently and would
     # flatter a setting that is bad for the phase we spend our time in.
-    $raw = & llama-bench -m $model -ngl $ngl -n $Tokens -p 0 -t 6 -o json 2>$null
-    if ($LASTEXITCODE -ne 0) {
+    # llama-bench writes progress to stderr. In Windows PowerShell, redirecting
+    # a native command's stderr wraps every line in a NativeCommandError and
+    # trips $ErrorActionPreference = "Stop" even on a clean exit -- so the
+    # preference is relaxed around the call rather than the stream redirected.
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    $raw = & llama-bench -m $model -ngl $ngl -n $Tokens -p 0 -t 6 -o json
+    $code = $LASTEXITCODE
+    $ErrorActionPreference = $prev
+    if ($code -ne 0) {
         Write-Host "failed (likely out of VRAM) - stopping" -ForegroundColor DarkYellow
         break
     }

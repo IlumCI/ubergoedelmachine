@@ -35,11 +35,27 @@ Q6_K is 6.97 GB. **Nothing above Q3_K_S fits in 4 GB**, so Q6 necessarily means
 a split load. Generation is memory-bandwidth-bound, so throughput follows
 directly from where the weights live:
 
-| offload | estimated |
+Predicted, then measured on the actual card with `llama-bench` (Q6_K, 64
+generated tokens, `-t 6`):
+
+| `-ngl` | measured tok/s |
 |---|---|
-| 0% (CPU only) | ~5.9 tok/s |
-| 30% | ~7.7 tok/s |
-| ~44% (the most that fits) | ~9.0 tok/s |
+| 6 | 6.11 |
+| 10 | 6.72 |
+| 14 | 7.59 |
+| **18** | **8.64** |
+| 22 | 5.39 |
+
+The arithmetic above predicted ~9.0 tok/s at roughly 44% offload; the real
+figure is 8.64 at 18 layers, so the throughput estimate held and the layer
+estimate was conservative.
+
+The shape at 22 is the point worth internalising: it does not plateau, it
+**collapses** — below even the 6-layer result. One layer past what VRAM holds,
+llama.cpp spills and every token pays for it. That is why the sweep stops on a
+drop rather than continuing to the end of its range, and why this number has
+to be re-measured whenever the context size changes, since the KV cache comes
+out of the same 4 GB.
 
 So a ~500-token decision record is around **55 s single-stream**, against 85 s
 on CPU alone. The split is worth doing — roughly 1.5× — but it is not the lever
@@ -59,9 +75,9 @@ that matters most.
    round rather than once per episode. Interleaving one episode-specific token
    into the stable band silently costs more than every other optimisation here
    returns.
-3. **Partial offload** (`-ngl`). ~1.5×. Measure it with `scripts/tune-ngl.ps1`;
-   one layer past the VRAM limit llama.cpp spills and throughput falls off a
-   cliff rather than plateauing.
+3. **Partial offload** (`-ngl 18`). ~1.4× over CPU-only, measured. Re-measure
+   with `scripts/tune-ngl.ps1` after any context-size change;
+   `scripts/refine.ps1` then narrows it layer by layer.
 4. **Grammar-constrained decoding.** Does not speed up a token, but removes the
    retries — and a retry costs a whole generation.
 5. **8-bit KV cache and flash attention.** Both cut memory traffic, which is
