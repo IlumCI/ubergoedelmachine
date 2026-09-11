@@ -10,9 +10,10 @@ how it is positioned against the Gödel-machine literature.
 
 ## Status
 
-**M3 complete**, plus container confinement and the Deviant. 269 tests green
-across twelve crates. The arms race runs: the adversary throws real attacks at
-the real guards, and the containment index falls only on a genuinely new breach.
+**M3 complete**, plus container confinement, the Deviant, and the reflection
+pass. 289 tests green across thirteen crates. Level-1 mutations are now mined
+from run outcomes — carrying their evidence, never authored by the model — and
+fed to the nested search.
 
 Measured, not asserted: the certificate's false-certification rate is **0.022**
 against a bound of 0.05, and level-2 nested search reaches a known optimum in
@@ -36,6 +37,7 @@ RustLMHub — is in [docs/inference.md](docs/inference.md).
 | `samaritan-episode` | level-0 rollout: sandbox, decide/route/execute loop, oracle, score — done |
 | `samaritan-cert` | test martingale, α-investing, provenance check — done |
 | `samaritan-search` | NRPA over self-reference depth, policy state, applier — done |
+| `samaritan-reflect` | lessons mined from ledger outcomes (not self-report), fed to the search — done |
 
 ## Building on Windows
 

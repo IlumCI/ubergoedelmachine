@@ -984,6 +984,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "samaritan-reflect"
+version = "0.1.0"
+dependencies = [
+ "samaritan-dsl",
+ "samaritan-kernel",
+ "samaritan-ledger",
+ "samaritan-search",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "samaritan-router"
 version = "0.1.0"
 dependencies = [
