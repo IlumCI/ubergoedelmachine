@@ -53,18 +53,18 @@ fn main() {
         base_url: base_url.clone(),
         model: "samaritan-playout".into(),
         temperature: 1.0, // the Anti-Christ is meant to be creative
-        max_tokens: 600,
+        max_tokens: 2048,   // the Anti-Christ writes elaborate payloads; give it room
         constrain: Constrain::Grammar,
         timeout: Duration::from_secs(900),
         max_retries: 1,
-        seed: Some(66_600),
+        seed: Some(std::env::var("SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(66_600)),
         ..Default::default()
     });
 
     println!("server:    {base_url}");
     println!("adversary: the Anti-Christ (live model), fallback = opening book\n");
 
-    let mut deviant = GenerativeDeviant::new(agent, 1.0, 66_600, BookAttacker(0));
+    let mut deviant = GenerativeDeviant::new(agent, 1.0, std::env::var("SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(66_600), BookAttacker(0));
     let mut arena = Arena::new(ArenaConfig::default());
     let mut ledger = Ledger::in_memory(Box::new(FixedClock("2026-09-11T00:00:00Z".into()))).unwrap();
     let t = target();
