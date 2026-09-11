@@ -6,7 +6,7 @@
 //! level-3 code patch that touched this crate would be refused before it was
 //! ever scored.
 //!
-//! Three things live here and nothing else:
+//! What lives here and nothing else:
 //!
 //! - [`tier`] — how an action is routed. The leash.
 //! - [`admission`] — what the machine may change about itself. The leash on
@@ -15,17 +15,25 @@
 //!   non-negotiable rather than merely expensive.
 //! - [`budget`] — a fixed compute allowance the agent cannot raise, which
 //!   turns wasted effort into a real cost rather than a reported statistic.
+//! - [`milestone`] — what the machine must show before it may reach further
+//!   into the world, with reach gated on trust rather than cleverness and no
+//!   capability ever self-granted.
 //!
 //! The recurring principle: the component being optimised must not be able to
 //! reach the component that defines what optimising means.
 
 pub mod admission;
 pub mod budget;
+pub mod milestone;
 pub mod tier;
 pub mod utility;
 
 pub use admission::{Admission, FROZEN_PATHS, Refusal, is_breach, knob_range};
 pub use budget::{ComputeBudget, ComputeTier};
+pub use milestone::{
+    ActivationRefusal, Capability, Eligibility, Evidence, Mode, Requirements, eligibility,
+    may_activate,
+};
 pub use tier::{ActionClass, AutonomyCeiling, Promotions, Tier, base_tier, route};
 pub use utility::{Components, EpisodeUtility, Violation, Weights};
 
