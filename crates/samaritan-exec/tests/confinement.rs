@@ -418,3 +418,114 @@ fn a_jail_must_exist_before_it_can_confine_anything() {
     let missing = dir.path().join("not-created");
     assert!(Executor::new(&missing, Confinement::PathChecked).is_err());
 }
+
+// ------------------------------------------------- command normalization
+
+use samaritan_exec::proc::normalize_command;
+
+#[test]
+fn a_fused_command_is_split() {
+    // What the model actually emitted: {"program": "cargo build", "args": []}.
+    let n = normalize_command("cargo build", &[]).expect("should split");
+    assert_eq!(n.program, "cargo");
+    assert_eq!(n.args, vec!["build"]);
+    assert_eq!(n.from, "cargo build");
+}
+
+#[test]
+fn several_arguments_all_move_across() {
+    let n = normalize_command("cargo test --quiet --lib", &[]).unwrap();
+    assert_eq!(n.program, "cargo");
+    assert_eq!(n.args, vec!["test", "--quiet", "--lib"]);
+}
+
+#[test]
+fn a_caller_that_supplied_args_is_left_alone() {
+    // Supplying args means the schema was understood; the program string is
+    // then theirs, spaces and all.
+    assert_eq!(normalize_command("my program", &["--x".to_string()]), None);
+}
+
+#[test]
+fn a_plain_program_is_untouched() {
+    assert_eq!(normalize_command("git", &[]), None);
+    assert_eq!(normalize_command("  git  ", &[]), None);
+}
+
+#[test]
+fn a_real_path_containing_spaces_is_not_split() {
+    // The case that makes naive splitting wrong. A file that exists is a
+    // path, not a fused command, however many spaces it has.
+    let dir = tempfile::tempdir().unwrap();
+    let spaced = dir.path().join("Program Files");
+    std::fs::create_dir_all(&spaced).unwrap();
+    let exe = spaced.join("tool.exe");
+    std::fs::write(&exe, b"stub").unwrap();
+
+    let p = exe.to_string_lossy().to_string();
+    assert!(p.contains(' '), "fixture must contain a space");
+    assert_eq!(
+        normalize_command(&p, &[]),
+        None,
+        "an existing path must survive untouched"
+    );
+}
+
+#[test]
+fn a_quoted_executable_keeps_its_spaces() {
+    let n = normalize_command(r#""C:\Program Files\Git\bin\git.exe" --version"#, &[]).unwrap();
+    assert_eq!(n.program, r"C:\Program Files\Git\bin\git.exe");
+    assert_eq!(n.args, vec!["--version"]);
+}
+
+#[test]
+fn an_empty_program_is_not_invented() {
+    assert_eq!(normalize_command("", &[]), None);
+    assert_eq!(normalize_command("   ", &[]), None);
+}
+
+#[test]
+fn the_split_actually_runs_and_is_recorded_in_the_evidence() {
+    // End to end: the fused form now works, and the ledger can see that the
+    // executor changed the request.
+    let (_g, mut e) = exec();
+    let o = e.run_op(&Op::Run {
+        program: "git --version".into(),
+        args: vec![],
+        timeout_secs: 30,
+    });
+    assert!(o.succeeded, "evidence: {}", o.evidence);
+    assert!(o.evidence["stdout"].as_str().unwrap().contains("git version"));
+    assert_eq!(o.evidence["normalized"]["from"], "git --version");
+    assert_eq!(o.evidence["program"], "git");
+    assert_eq!(o.evidence["args"], serde_json::json!(["--version"]));
+}
+
+#[test]
+fn an_untouched_command_records_no_normalization() {
+    let (_g, mut e) = exec();
+    let o = e.run_op(&Op::Run {
+        program: "git".into(),
+        args: vec!["--version".into()],
+        timeout_secs: 30,
+    });
+    assert!(o.succeeded);
+    assert!(
+        o.evidence["normalized"].is_null(),
+        "nothing was changed, so nothing should be claimed"
+    );
+}
+
+#[test]
+fn splitting_does_not_bypass_the_jail() {
+    // A split command is still just a command: same cwd, same routing, same
+    // everything. Normalization is a parsing fix, not a privilege change.
+    let (_g, mut e) = exec();
+    let o = e.run_op(&Op::Run {
+        program: "git rev-parse --show-toplevel".into(),
+        args: vec![],
+        timeout_secs: 30,
+    });
+    assert_eq!(o.observed_kind, ActionKind::Exec);
+    assert_eq!(o.observed_blast_radius, BlastRadius::Machine);
+}

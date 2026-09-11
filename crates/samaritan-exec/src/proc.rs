@@ -212,3 +212,100 @@ fn libc_setsid() {
         setsid();
     }
 }
+
+/// What [`normalize_command`] did, if anything.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Normalization {
+    /// The `program` string as the caller supplied it.
+    pub from: String,
+    /// What it was split into.
+    pub program: String,
+    pub args: Vec<String>,
+}
+
+/// Split a fused command string into program and arguments.
+///
+/// Models routinely emit `{"program": "cargo build", "args": []}`, which
+/// spawns a binary named `cargo build` and fails with a confusing "program
+/// not found". Fixing that in the prompt is possible but fragile — it is one
+/// more instruction competing for attention in a model whose
+/// instruction-following was already damaged by ablation, and it fails
+/// silently when it does not take. Accepting the input here is robust, and
+/// costs nothing when the caller got it right.
+///
+/// Deliberately conservative, because a Windows executable path legitimately
+/// contains spaces and splitting `C:\Program Files\Git\bin\git.exe` would
+/// break something that was correct. Four conditions must all hold:
+///
+/// 1. `args` is empty — a caller that supplied arguments understood the
+///    schema, and the program string is theirs to keep.
+/// 2. `program` contains whitespace outside of quotes.
+/// 3. `program` is not itself an existing file, so real paths with spaces
+///    survive untouched.
+/// 4. The split yields a non-empty program.
+///
+/// The result is reported rather than applied silently: the ledger should
+/// show what was actually run next to what was asked for, because an
+/// execution that quietly differs from the request is the kind of thing this
+/// harness exists to make visible.
+pub fn normalize_command(program: &str, args: &[String]) -> Option<Normalization> {
+    if !args.is_empty() {
+        return None;
+    }
+    let trimmed = program.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let parts = split_command(trimmed);
+    if parts.len() < 2 {
+        return None;
+    }
+
+    // A real path that happens to contain spaces. Only reachable when the
+    // file exists, so this cannot be used to smuggle anything: a nonexistent
+    // path still splits, and a split command still goes through the jail and
+    // the router like any other.
+    if std::path::Path::new(trimmed).is_file() {
+        return None;
+    }
+
+    let (head, tail) = parts.split_first()?;
+    if head.is_empty() {
+        return None;
+    }
+
+    Some(Normalization {
+        from: program.to_string(),
+        program: head.clone(),
+        args: tail.to_vec(),
+    })
+}
+
+/// Whitespace split that respects double quotes.
+///
+/// Not a full shell parser, and deliberately not one — the executor does not
+/// run a shell, so honouring shell metacharacters here would imply a
+/// capability that does not exist. Quotes are handled only because a quoted
+/// path is the common way to write an executable containing spaces.
+fn split_command(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+
+    for c in s.chars() {
+        match c {
+            '"' => in_quotes = !in_quotes,
+            c if c.is_whitespace() && !in_quotes => {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+            }
+            c => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}

@@ -373,6 +373,16 @@ impl Executor {
     }
 
     fn run_program(&self, program: &str, args: &[String], timeout_secs: u64) -> Outcome {
+        // Accept a fused "cargo build" and split it, rather than spawning a
+        // binary by that name and failing confusingly. Recorded in the
+        // evidence so the ledger shows what actually ran beside what was
+        // asked for.
+        let fixed = proc::normalize_command(program, args);
+        let (program, args) = match &fixed {
+            Some(n) => (n.program.as_str(), n.args.as_slice()),
+            None => (program, args),
+        };
+
         let out = proc::run(
             program,
             args,
@@ -394,6 +404,7 @@ impl Executor {
             evidence: serde_json::json!({
                 "program": program,
                 "args": args,
+                "normalized": fixed,
                 "completion": out.completion,
                 "stdout": out.stdout,
                 "stderr": out.stderr,
