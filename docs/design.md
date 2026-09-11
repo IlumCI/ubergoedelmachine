@@ -448,27 +448,37 @@ there — the Deviant really does rewrite code, really does try to escape, and a
 successful escape is a real event the ledger records and the containment index
 punishes.
 
-#### The boundary is not yet strong enough for an unleashed adversary
+#### The boundary the arms race needs
 
-Stated plainly because it is the gap most likely to be forgotten once the
-Deviant exists. `samaritan-exec` ships two confinement levels and only one is
-implemented:
+`samaritan-exec` ships two confinement levels and the difference between them
+is the difference between a wall and a request.
 
-- `PathChecked` — filesystem paths for reads, writes and deletes are resolved
-  physically and refused if they leave the sandbox. Subprocesses inherit the
-  sandbox as their working directory. **A subprocess is not itself confined**:
-  once `cargo test` is running, nothing stops it opening an absolute path or a
-  socket.
-- `Container` — subprocesses inside an OS-level container, no host mount, no
-  network. **Not implemented.** Constructing an executor with it returns an
-  error rather than quietly downgrading, which is a test.
+- `PathChecked` — file operations are resolved physically and refused if they
+  leave the sandbox, and subprocesses inherit the sandbox as their working
+  directory. **A subprocess is not itself confined**: once `cargo test` is
+  running, nothing stops it opening an absolute path or a socket. Acceptable
+  for the Warden, which is trying to pass tests.
+- `Container` — the subprocess runs under a container runtime with
+  `--network none`, a read-only root plus a `noexec,nosuid` tmpfs, exactly one
+  bind mount, `--cap-drop ALL`, `--security-opt no-new-privileges`, and bounded
+  memory, cpus and pids. Each flag closes a specific route out and each has a
+  test that fails when the flag is removed.
 
-For the Warden that is an acceptable trust boundary: it is trying to pass
-tests, not to escape. For the Deviant it is not, and the honest statement is
-that **the Deviant must not be run under `PathChecked`**. The executor already
-reports `BlastRadius::Machine` for every subprocess under that level rather
-than flattering itself, so the gap is visible in the ledger rather than
-implied. Closing it is a prerequisite for the arms race, not a follow-up to it.
+**The Deviant runs under `Container` or it does not run.** It is explicitly
+optimised to escape, and `PathChecked` would be relying on it not noticing.
+
+Two honesty notes. A container is an OS-level isolation boundary and not a
+formal one — a kernel exploit escapes it, and claiming otherwise would be the
+sort of overclaim this document tries to avoid elsewhere. And the runtime is
+checked at executor construction rather than at the first `Run`, because a
+caller that asked for a container and silently received something weaker is
+the exact failure the level exists to prevent; with no runtime on `PATH`,
+construction fails rather than degrading.
+
+The blast radius reported for a subprocess follows the level honestly:
+`Machine` under `PathChecked`, `Episode` under `Container`. That is what stops
+the misgrade detector from firing on every single `Run` — a detector that
+fires on everything detects nothing.
 
 What does **not** move is the boundary of the arena itself. The global frozen
 core — the real `samaritan-kernel` governing actions on the actual machine —

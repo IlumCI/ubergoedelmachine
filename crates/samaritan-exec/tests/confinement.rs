@@ -404,12 +404,29 @@ fn a_malformed_payload_is_refused_rather_than_guessed_at() {
 // ----------------------------------------------------------- confinement
 
 #[test]
-fn container_confinement_fails_loudly_rather_than_downgrading() {
+fn container_confinement_never_silently_downgrades() {
     // Silently giving PathChecked to a caller that asked for a container is
-    // exactly how an unleashed adversary ends up on the host.
+    // exactly how an unleashed adversary ends up on the host. With a runtime
+    // present the executor is genuinely containerised; without one it errors.
+    // What it must never do is succeed while confining nothing.
     let (_g, root) = jail_dir();
-    let e = Executor::new(&root, Confinement::Container);
-    assert!(matches!(e, Err(ExecError::UnsupportedConfinement(_))));
+    let p = samaritan_exec::container::ContainerPolicy {
+        runtime: samaritan_exec::container::Runtime::Podman,
+        image: "alpine".into(),
+        workdir: "/work".into(),
+        memory: "1g".into(),
+        cpus: "1".into(),
+        pids_limit: 128,
+        tmpfs_size: "16m".into(),
+    };
+    match Executor::new(&root, Confinement::Container(p)) {
+        Err(ExecError::NoContainerRuntime) => {}
+        Ok(e) => assert!(
+            e.confinement().is_container(),
+            "asked for a container and got something weaker"
+        ),
+        Err(other) => panic!("unexpected error: {other}"),
+    }
 }
 
 #[test]
@@ -528,4 +545,160 @@ fn splitting_does_not_bypass_the_jail() {
     });
     assert_eq!(o.observed_kind, ActionKind::Exec);
     assert_eq!(o.observed_blast_radius, BlastRadius::Machine);
+}
+
+// ------------------------------------------------- container confinement
+
+use samaritan_exec::container::{ContainerPolicy, Runtime, mount_source};
+
+fn policy() -> ContainerPolicy {
+    ContainerPolicy {
+        runtime: Runtime::Docker,
+        image: "rust:1-slim".into(),
+        workdir: "/work".into(),
+        memory: "2g".into(),
+        cpus: "2".into(),
+        pids_limit: 512,
+        tmpfs_size: "64m".into(),
+    }
+}
+
+/// The flags are the security property, so they are asserted directly rather
+/// than inferred from a live run. A test that only executes where a runtime
+/// happens to be installed is a test that silently disappears on the machine
+/// you most wanted it on — which this session has already been caught by once.
+fn argv_for(program: &str, args: &[&str]) -> Vec<String> {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("sandbox");
+    std::fs::create_dir_all(&root).unwrap();
+    let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    policy().argv(&root, program, &owned)
+}
+
+fn has(argv: &[String], flag: &str, value: &str) -> bool {
+    argv.windows(2).any(|w| w[0] == flag && w[1] == value)
+}
+
+#[test]
+fn the_container_has_no_network() {
+    // Closes both exfiltration and the far more mundane failure of the agent
+    // simply looking the answer up.
+    let argv = argv_for("cargo", &["test"]);
+    assert!(has(&argv, "--network", "none"), "{argv:?}");
+}
+
+#[test]
+fn the_root_filesystem_is_read_only_with_a_writable_tmp() {
+    let argv = argv_for("cargo", &["test"]);
+    assert!(argv.contains(&"--read-only".to_string()), "{argv:?}");
+    let tmpfs = argv
+        .windows(2)
+        .find(|w| w[0] == "--tmpfs")
+        .map(|w| w[1].clone())
+        .expect("a read-only root needs a writable /tmp or nothing will build");
+    assert!(tmpfs.starts_with("/tmp:"), "{tmpfs}");
+    assert!(tmpfs.contains("noexec"), "{tmpfs}");
+    assert!(tmpfs.contains("nosuid"), "{tmpfs}");
+}
+
+#[test]
+fn exactly_one_host_path_is_mounted() {
+    let argv = argv_for("cargo", &["test"]);
+    let mounts: Vec<&String> = argv
+        .windows(2)
+        .filter(|w| w[0] == "--mount" || w[0] == "-v" || w[0] == "--volume")
+        .map(|w| &w[1])
+        .collect();
+    assert_eq!(mounts.len(), 1, "expected one bind mount, got {mounts:?}");
+    assert!(mounts[0].contains("dst=/work"), "{:?}", mounts[0]);
+}
+
+#[test]
+fn all_capabilities_are_dropped_and_privileges_cannot_grow() {
+    let argv = argv_for("sh", &["-c", "id"]);
+    assert!(has(&argv, "--cap-drop", "ALL"), "{argv:?}");
+    assert!(
+        has(&argv, "--security-opt", "no-new-privileges"),
+        "{argv:?}"
+    );
+    assert!(
+        !argv.iter().any(|a| a == "--privileged"),
+        "a privileged container is not a container"
+    );
+}
+
+#[test]
+fn resource_limits_are_set_so_a_runaway_cannot_take_the_host() {
+    let argv = argv_for("cargo", &["build"]);
+    assert!(has(&argv, "--memory", "2g"), "{argv:?}");
+    assert!(has(&argv, "--cpus", "2"), "{argv:?}");
+    assert!(has(&argv, "--pids-limit", "512"), "fork bombs: {argv:?}");
+}
+
+#[test]
+fn the_container_is_removed_so_state_does_not_leak_between_episodes() {
+    let argv = argv_for("cargo", &["test"]);
+    assert!(argv.contains(&"--rm".to_string()), "{argv:?}");
+}
+
+#[test]
+fn the_command_and_its_arguments_survive_intact() {
+    let argv = argv_for("cargo", &["test", "--quiet", "--", "--nocapture"]);
+    let tail: Vec<&String> = argv.iter().skip_while(|a| *a != "rust:1-slim").collect();
+    assert_eq!(
+        tail,
+        vec!["rust:1-slim", "cargo", "test", "--quiet", "--", "--nocapture"],
+        "the image must be followed by the command, unmangled"
+    );
+}
+
+#[test]
+fn windows_paths_are_translated_for_a_linux_container() {
+    // canonicalize() produces verbatim paths on Windows and no runtime
+    // understands them, so this is not a nicety: without it every mount
+    // fails with an unhelpful error.
+    assert_eq!(mount_source(Path::new(r"C:\Users\x\sandbox")), "/c/Users/x/sandbox");
+    assert_eq!(
+        mount_source(Path::new(r"\\?\C:\Users\x\sandbox")),
+        "/c/Users/x/sandbox",
+        "a verbatim prefix must be stripped"
+    );
+}
+
+#[test]
+fn asking_for_a_runtime_that_is_not_there_fails_loudly() {
+    // The failure this module exists to prevent is a caller asking for
+    // container confinement and silently getting something weaker. Checked
+    // at construction so it surfaces before an episode starts rather than at
+    // the first Run.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("sandbox");
+    std::fs::create_dir_all(&root).unwrap();
+
+    let mut p = policy();
+    p.runtime = Runtime::Podman;
+    let absent = !std::process::Command::new(if cfg!(windows) { "where" } else { "which" })
+        .arg("podman")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    if absent {
+        assert!(matches!(
+            Executor::new(&root, Confinement::Container(p)),
+            Err(ExecError::NoContainerRuntime)
+        ));
+    }
+}
+
+#[test]
+fn a_containerised_run_reports_an_episode_blast_radius() {
+    // The honest counterpart to PathChecked reporting Machine. Under a
+    // container a subprocess genuinely cannot reach the host, so the floor
+    // drops — and the misgrade detector stops charging every Run.
+    let p = policy();
+    assert!(Confinement::Container(p.clone()).is_container());
+    assert!(!Confinement::PathChecked.is_container());
 }

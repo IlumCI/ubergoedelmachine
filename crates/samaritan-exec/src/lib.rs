@@ -17,6 +17,7 @@
 //! [`ExploitClass::TierMisgrade`]: https://docs.rs/samaritan-ledger
 
 pub mod confine;
+pub mod container;
 pub mod oracle;
 pub mod proc;
 
@@ -28,6 +29,7 @@ use samaritan_kernel::Violation;
 use serde::{Deserialize, Serialize};
 
 pub use confine::{Jail, PathRefusal};
+pub use container::{ContainerPolicy, Runtime};
 pub use oracle::SandboxOracle;
 pub use proc::{Completion, Output};
 
@@ -36,7 +38,7 @@ pub use proc::{Completion, Output};
 /// Named in the type rather than left to a comment, because the two levels
 /// differ in a way that matters to the arms race and the difference is
 /// otherwise invisible at the call site.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Confinement {
     /// Filesystem paths for `Read`/`Write`/`Delete` are validated against the
     /// jail, and subprocesses inherit the sandbox as their working directory.
@@ -48,11 +50,21 @@ pub enum Confinement {
     /// it is not, and running an unleashed adversary under this level is
     /// relying on it not noticing.
     PathChecked,
-    /// Subprocesses run inside an OS-level container with no host mount and no
-    /// network. Not yet implemented; the variant exists so that code which
-    /// requires real confinement can demand it by name today and fail loudly
-    /// rather than silently getting `PathChecked`.
-    Container,
+    /// Subprocesses run inside a container: no network, one bind mount, no
+    /// capabilities, bounded memory and pids. See [`container`] for what each
+    /// flag closes off.
+    ///
+    /// The policy travels with the variant rather than sitting in a config
+    /// somewhere, because the flags *are* the confinement — a `Container`
+    /// that did not say which image and which limits would be a name for a
+    /// promise rather than the promise itself.
+    Container(ContainerPolicy),
+}
+
+impl Confinement {
+    pub fn is_container(&self) -> bool {
+        matches!(self, Confinement::Container(_))
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -60,8 +72,8 @@ pub enum ExecError {
     #[error("sandbox is unusable: {0}")]
     Sandbox(PathRefusal),
 
-    #[error("{0} confinement is not implemented yet")]
-    UnsupportedConfinement(&'static str),
+    #[error("no container runtime found on PATH; tried docker, nerdctl and podman")]
+    NoContainerRuntime,
 
     #[error("malformed action payload: {0}")]
     Malformed(String),
@@ -162,6 +174,22 @@ impl Outcome {
     }
 }
 
+/// Whether a specific runtime is callable.
+///
+/// Separate from `Runtime::detect`, which returns the *first* runtime found:
+/// a caller that named podman must get podman or an error, never docker
+/// quietly substituted.
+fn which_runtime(r: crate::container::Runtime) -> bool {
+    let probe = if cfg!(windows) { "where" } else { "which" };
+    std::process::Command::new(probe)
+        .arg(r.program())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 /// Executes actions inside one episode sandbox.
 pub struct Executor {
     jail: Jail,
@@ -171,8 +199,17 @@ pub struct Executor {
 
 impl Executor {
     pub fn new(root: &Path, confinement: Confinement) -> Result<Self, ExecError> {
-        if confinement == Confinement::Container {
-            return Err(ExecError::UnsupportedConfinement("Container"));
+        // Checked at construction rather than at the first `Run`. A caller
+        // that asked for container confinement and silently got something
+        // weaker is the failure this whole module exists to prevent, and the
+        // moment to find out is before an episode starts.
+        if let Confinement::Container(p) = &confinement {
+            if !crate::container::Runtime::detect()
+                .is_some_and(|found| found == p.runtime)
+                && !which_runtime(p.runtime)
+            {
+                return Err(ExecError::NoContainerRuntime);
+            }
         }
         Ok(Self {
             jail: Jail::new(root).map_err(ExecError::Sandbox)?,
@@ -191,8 +228,8 @@ impl Executor {
         self.jail.root()
     }
 
-    pub fn confinement(&self) -> Confinement {
-        self.confinement
+    pub fn confinement(&self) -> &Confinement {
+        &self.confinement
     }
 
     /// Parse and run one proposed action.
@@ -383,20 +420,36 @@ impl Executor {
             None => (program, args),
         };
 
-        let out = proc::run(
-            program,
-            args,
-            self.jail.root(),
-            Duration::from_secs(timeout_secs),
-            &self.env,
-        );
+        let out = match &self.confinement {
+            Confinement::PathChecked => proc::run(
+                program,
+                args,
+                self.jail.root(),
+                Duration::from_secs(timeout_secs),
+                &self.env,
+            ),
+            Confinement::Container(policy) => {
+                let argv = policy.argv(self.jail.root(), program, args);
+                // The container inherits nothing of the host environment.
+                // Passing it through would be a small convenience and a real
+                // leak: API keys and paths are exactly what an adversary
+                // rewarded for escaping would like to read.
+                proc::run(
+                    policy.runtime.program(),
+                    &argv,
+                    self.jail.root(),
+                    Duration::from_secs(timeout_secs),
+                    &[],
+                )
+            }
+        };
 
         // Honest about the limitation rather than flattering: under
         // `PathChecked` a subprocess can reach the whole machine, so that is
         // the floor for every `Run`, whatever this particular one did.
-        let floor = match self.confinement {
+        let floor = match &self.confinement {
             Confinement::PathChecked => BlastRadius::Machine,
-            Confinement::Container => BlastRadius::Episode,
+            Confinement::Container(_) => BlastRadius::Episode,
         };
 
         Outcome {

@@ -10,7 +10,8 @@ how it is positioned against the Gödel-machine literature.
 
 ## Status
 
-**M3 complete.** 241 tests green across eleven crates.
+**M3 complete**, and container confinement is in — the prerequisite for the
+adversary. 254 tests green across eleven crates.
 
 Measured, not asserted: the certificate's false-certification rate is **0.022**
 against a bound of 0.05, and level-2 nested search reaches a known optimum in
@@ -27,7 +28,7 @@ RustLMHub — is in [docs/inference.md](docs/inference.md).
 | `samaritan-ledger` | hash-chained log, calibration, containment, experiment + frontier metrics — done |
 | `samaritan-adversary` | **The Deviant.** Unleashed coevolving adversary; arena only — not started |
 | `samaritan-corpus` | history miner, sealed sandboxes, flake screening, splits, frontier set — done |
-| `samaritan-exec` | confined actions, process timeouts, real oracle runner — done |
+| `samaritan-exec` | confined actions, container isolation, timeouts, oracle runner — done |
 | `samaritan-router` | tier dispatch, approval gating, misgrade detection, autonomy streaks — done |
 | `samaritan-agent` | OpenAI-compatible client, GBNF-constrained output, seeded runs — done |
 | `samaritan-cli` | inline approval prompt; no standing-permission option — done |
