@@ -49,7 +49,7 @@ size_gb = 6.49
 [serve]
 # Q6_K is 6.97 GB and the GPU has 4 GB, so this is a split load. Measure the
 # real best with scripts/tune-ngl.ps1 rather than trusting this default.
-gpu_layers = 14
+gpu_layers = 18            # measured; 18-19 equivalent, cliff at 20
 threads = 6                      # P-cores only; E-cores slow the batch down
 threads_batch = 10               # prompt processing is compute-bound, use all
 parallel = 4                     # batching amortises the weight read

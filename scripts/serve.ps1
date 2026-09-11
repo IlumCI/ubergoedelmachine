@@ -46,15 +46,16 @@
               Flash attention plus an 8-bit KV cache. Both cut memory traffic,
               which is the binding constraint.
 
-  --no-mmap   Read the whole model into RAM up front. With 16 GB total and a
-              7 GB model there is room, and it avoids page-cache eviction
-              stalling generation later in a long run.
+  (no mmap flag)
+              Upstream removed --no-mmap; loading behaviour is automatic now.
+              Verified against `llama-server --help` for build b10907 rather
+              than assumed, after the first launch died on the flag.
 
 .PARAMETER Ngl
   GPU layers to offload. Default 14; run tune-ngl.ps1 to find the real best.
 #>
 param(
-    [int]$Ngl = 14,
+    [int]$Ngl = 18,
     [int]$Port = 8080,
     [string]$ModelDir = "$env:USERPROFILE\models",
     [int]$Parallel = 4,
@@ -99,5 +100,4 @@ Write-Host "Ministral-3 8B Q6_K  |  ngl=$Ngl  parallel=$Parallel  ctx=$ctx ($Ctx
     --flash-attn on `
     --cache-type-k q8_0 `
     --cache-type-v q8_0 `
-    --no-mmap `
     --metrics

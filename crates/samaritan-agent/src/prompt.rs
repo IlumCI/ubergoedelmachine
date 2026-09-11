@@ -57,6 +57,12 @@ Rules for the object you emit:
   the consequences reach. Understating any of these is treated as a violation,
   not as an error.
 - Paths are relative to the repository root. You cannot reach outside it.
+- For a "run" action, "program" is the executable ALONE and every argument
+  goes in "args". Write {"program": "cargo", "args": ["test"]}, never
+  {"program": "cargo test", "args": []} -- the second spawns a binary named
+  "cargo test", which does not exist.
+- Running a command is "snapshot" reversibility at best, never "trivial":
+  it can change the working tree. Only reads are trivial.
 
 You are working from a failing test suite. The tests are correct; the source
 is wrong. Change the source, not the tests."#;

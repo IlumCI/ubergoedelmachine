@@ -229,6 +229,11 @@ impl Agent {
     pub fn new(cfg: AgentConfig) -> Self {
         let http = ureq::Agent::config_builder()
             .timeout_global(Some(cfg.timeout))
+            // Hand back non-2xx responses instead of turning them into a bare
+            // status code. A 400 whose body says which field the server
+            // rejected is a two-minute fix; a 400 with no body is a guessing
+            // game, and local servers disagree about which knobs they accept.
+            .http_status_as_error(false)
             .build()
             .new_agent();
         let fallback_seed = std::time::SystemTime::now()
@@ -246,11 +251,15 @@ impl Agent {
     ///
     /// Derived rather than random per call, so the whole run replays from one
     /// number while no two attempts share a sample path.
+    ///
+    /// Attempts are 1-based and the first one uses the configured seed
+    /// unchanged. Offsetting it would mean the number you pin is never the
+    /// number actually used, which defeats the point of pinning it.
     pub fn seed_for(&self, attempt: u32) -> u64 {
         self.cfg
             .seed
             .unwrap_or(self.fallback_seed)
-            .wrapping_add(u64::from(attempt))
+            .wrapping_add(u64::from(attempt.saturating_sub(1)))
     }
 
     pub fn config(&self) -> &AgentConfig {
@@ -344,14 +353,20 @@ impl Agent {
 
         let mut resp = match req.send_json(&body) {
             Ok(r) => r,
-            Err(ureq::Error::StatusCode(code)) => {
-                return Err(AgentError::Status {
-                    status: code,
-                    body: String::from("(status error)"),
-                });
-            }
             Err(e) => return Err(AgentError::Transport(e.to_string())),
         };
+
+        let status = resp.status().as_u16();
+        if !(200..300).contains(&status) {
+            let detail = resp
+                .body_mut()
+                .read_to_string()
+                .unwrap_or_else(|e| format!("(body unreadable: {e})"));
+            return Err(AgentError::Status {
+                status,
+                body: detail.chars().take(2000).collect(),
+            });
+        }
 
         let v: serde_json::Value = resp
             .body_mut()
@@ -464,5 +479,38 @@ mod tests {
     fn nested_objects_are_kept_whole() {
         let s = r#"{"a":{"b":{"c":1}}}"#;
         assert_eq!(extract_json(s), s);
+    }
+}
+
+#[cfg(test)]
+mod seed_tests {
+    use super::*;
+
+    #[test]
+    fn the_first_attempt_uses_the_seed_you_pinned() {
+        // Otherwise the number in the config is never the number used, and a
+        // "reproducible" run reproduces something you did not ask for.
+        let a = Agent::new(AgentConfig {
+            seed: Some(20260911),
+            ..Default::default()
+        });
+        assert_eq!(a.seed_for(1), 20260911);
+    }
+
+    #[test]
+    fn retries_walk_a_different_sample_path() {
+        let a = Agent::new(AgentConfig {
+            seed: Some(100),
+            ..Default::default()
+        });
+        assert_eq!((a.seed_for(1), a.seed_for(2), a.seed_for(3)), (100, 101, 102));
+    }
+
+    #[test]
+    fn an_unpinned_run_still_records_one_stable_seed() {
+        // No configured seed still means a knowable run: the agent fixes one
+        // at construction rather than drawing per call.
+        let a = Agent::new(AgentConfig::default());
+        assert_eq!(a.seed_for(1), a.seed_for(1));
     }
 }
