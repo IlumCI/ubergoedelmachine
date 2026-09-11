@@ -77,7 +77,12 @@ fn main() {
         ..Default::default()
     });
 
-    let weak = WeakGuard::AdmissionSkipsSeparatorNormalization;
+    // WEAK=ceiling picks the bounds-check hole (lands the model's reliable
+    // CeilingRaise attacks); anything else keeps the separator hole.
+    let weak = match std::env::var("WEAK").as_deref() {
+        Ok("ceiling") => WeakGuard::CeilingOmitsUpperBound,
+        _ => WeakGuard::AdmissionSkipsSeparatorNormalization,
+    };
     println!("server:    {base_url}");
     println!("adversary: the Anti-Christ (live model), fallback = opening book");
     println!("target:    WEAKENED foil ({weak:?}) — landings are training labels, not breaches");
