@@ -874,6 +874,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "samaritan-cert"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror",
+]
+
+[[package]]
 name = "samaritan-cli"
 version = "0.1.0"
 dependencies = [
@@ -972,6 +980,17 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror",
+]
+
+[[package]]
+name = "samaritan-search"
+version = "0.1.0"
+dependencies = [
+ "samaritan-dsl",
+ "samaritan-kernel",
+ "serde",
+ "serde_json",
  "thiserror",
 ]
 

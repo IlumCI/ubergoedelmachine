@@ -1,0 +1,10 @@
+[package]
+name = "samaritan-cert"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+thiserror = "2.0.20"
