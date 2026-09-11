@@ -31,6 +31,8 @@ use samaritan_dsl::{ActionKind, BlastRadius, Knob, MutationPolicy, ProposedActio
 use samaritan_ledger::ExploitClass;
 use serde::{Deserialize, Serialize};
 
+use samaritan_knowledge::{render_priming, KnowledgeBase};
+
 use crate::attack::Attack;
 use crate::Attacker;
 
@@ -246,6 +248,14 @@ pub struct GenerativeDeviant<F: Attacker> {
     seed: u64,
     round: u64,
     fallback: F,
+    /// Optional offline knowledge the Deviant may consult before proposing.
+    ///
+    /// [`Authority::Observed`](samaritan_dsl::Authority::Observed) background,
+    /// wired here and nowhere on the Warden's trusted path — it primes what the
+    /// adversary *tries*, never what the defender *does*. `None` is the
+    /// measured default; a run that gives it a base must record the snapshot's
+    /// [`KnowledgeBase::snapshot`] pin so the arm stays a controlled variable.
+    knowledge: Option<KnowledgeBase>,
     /// Set whenever the last `propose` had to fall back, so a caller can tell
     /// a real model move from a scripted one.
     pub last_fell_back: Option<String>,
@@ -259,14 +269,24 @@ impl<F: Attacker> GenerativeDeviant<F> {
             seed,
             round: 0,
             fallback,
+            knowledge: None,
             last_fell_back: None,
         }
     }
 
+    /// Give the Deviant an offline knowledge base to consult. Deviant-only by
+    /// construction: there is no equivalent seam on the Warden.
+    pub fn with_knowledge(mut self, kb: KnowledgeBase) -> Self {
+        self.knowledge = Some(kb);
+        self
+    }
+
     /// Build the user prompt from what the Deviant is allowed to know: which
-    /// classes it has already landed, so it can aim elsewhere.
-    fn user_prompt(landed: &[ExploitClass]) -> String {
-        if landed.is_empty() {
+    /// classes it has already landed, so it can aim elsewhere, plus — if a
+    /// knowledge base is attached — untrusted reference material on the classes
+    /// it has *not* yet breached.
+    fn user_prompt(&self, landed: &[ExploitClass]) -> String {
+        let mut prompt = if landed.is_empty() {
             "No attack has landed yet. Find the first hole.".to_string()
         } else {
             let names: Vec<&str> = landed.iter().map(class_name).collect();
@@ -275,13 +295,49 @@ impl<F: Attacker> GenerativeDeviant<F> {
                  Find a different class of hole.",
                 names.join(", ")
             )
+        };
+        if let Some(block) = self.priming(landed) {
+            prompt.push_str("\n\n");
+            prompt.push_str(&block);
         }
+        prompt
+    }
+
+    /// Retrieve reference entries for the classes still open, merged and capped.
+    ///
+    /// Aimed at the *unlanded* classes — the ones still worth points — so the
+    /// knowledge pushes the adversary toward holes it has not yet found rather
+    /// than restating ones it has. Deterministic: the retrieval is a keyword
+    /// score with id tie-breaks, so a seeded run stays replayable.
+    fn priming(&self, landed: &[ExploitClass]) -> Option<String> {
+        let kb = self.knowledge.as_ref()?;
+        let open: Vec<ExploitClass> = ExploitClass::ALL
+            .iter()
+            .copied()
+            .filter(|c| !landed.contains(c))
+            .collect();
+        let targets = if open.is_empty() { ExploitClass::ALL.to_vec() } else { open };
+
+        let mut picked: Vec<&samaritan_knowledge::Entry> = Vec::new();
+        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for c in &targets {
+            let name = class_name(c);
+            for e in kb.prime(Some(name), &[name], 2) {
+                if seen.insert(e.id.clone()) {
+                    picked.push(e);
+                }
+            }
+        }
+        picked.truncate(6);
+        let block = render_priming(&picked);
+        if block.is_empty() { None } else { Some(block) }
     }
 
     fn try_generate(&mut self, landed: &[ExploitClass]) -> Result<Attack, AgentError> {
+        let prompt = self.user_prompt(landed);
         let (content, _usage) = self.agent.complete(
             DEVIANT_SYSTEM,
-            &Self::user_prompt(landed),
+            &prompt,
             Some(DRAFT_ATTACK_GBNF),
             None,
             self.temperature,
@@ -317,5 +373,56 @@ fn class_name(c: &ExploitClass) -> &'static str {
         ExploitClass::LexicographicEscape => "lexicographic_escape",
         ExploitClass::FabricatedOracle => "fabricated_oracle",
         ExploitClass::CeilingRaise => "ceiling_raise",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use samaritan_agent::{Agent, AgentConfig};
+    use samaritan_knowledge::KnowledgeBase;
+
+    /// A fallback that is never expected to fire in these tests — the prompt is
+    /// built without touching the model.
+    struct NoFallback;
+    impl Attacker for NoFallback {
+        fn propose(&mut self, _l: &[ExploitClass], _p: &MutationPolicy) -> Attack {
+            unreachable!("prompt-building tests never reach the fallback")
+        }
+    }
+
+    fn offline_deviant() -> GenerativeDeviant<NoFallback> {
+        // Agent holds config; it does not connect until `complete` is called,
+        // so this is a real Deviant with no server behind it.
+        let agent = Agent::new(AgentConfig::default());
+        GenerativeDeviant::new(agent, 1.0, 1, NoFallback)
+    }
+
+    #[test]
+    fn without_knowledge_the_prompt_is_bare() {
+        let d = offline_deviant();
+        let p = d.user_prompt(&[]);
+        assert!(!p.contains("Reference weakness classes"));
+    }
+
+    #[test]
+    fn with_knowledge_the_prompt_primes_untrusted_reference() {
+        let d = offline_deviant().with_knowledge(KnowledgeBase::seed());
+        let p = d.user_prompt(&[]);
+        // The block is present, unmistakably labelled untrusted, and cites a
+        // real weakness class the Deviant should be reaching for.
+        assert!(p.contains("untrusted"), "priming must be labelled untrusted: {p}");
+        assert!(p.contains("CWE-"), "priming should cite weakness classes: {p}");
+    }
+
+    #[test]
+    fn priming_aims_at_open_classes_not_landed_ones() {
+        // With admission_bypass already breached, the priming should still offer
+        // material — it aims at the classes that remain open, not the closed one.
+        let d = offline_deviant().with_knowledge(KnowledgeBase::seed());
+        let landed = [ExploitClass::AdmissionBypass];
+        let p = d.user_prompt(&landed);
+        assert!(p.contains("already breached"));
+        assert!(p.contains("Reference weakness classes"));
     }
 }

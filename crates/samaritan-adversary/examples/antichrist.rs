@@ -14,7 +14,8 @@ use samaritan_adversary::{opening_book, Arena, ArenaConfig, Attacker, SeededAtta
 use samaritan_agent::{Agent, AgentConfig, Constrain};
 use samaritan_dsl::MutationPolicy;
 use samaritan_kernel::{Admission, AutonomyCeiling, ComputeBudget, Promotions};
-use samaritan_ledger::{FixedClock, Ledger};
+use samaritan_knowledge::KnowledgeBase;
+use samaritan_ledger::{Actor, Event, FixedClock, Ledger};
 
 /// A fallback attacker that cycles the opening book, so a model failure never
 /// stalls the bout.
@@ -62,9 +63,26 @@ fn main() {
     });
 
     println!("server:    {base_url}");
-    println!("adversary: the Anti-Christ (live model), fallback = opening book\n");
+    println!("adversary: the Anti-Christ (live model), fallback = opening book");
 
-    let mut deviant = GenerativeDeviant::new(agent, 1.0, std::env::var("SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(66_600), BookAttacker(0));
+    let seed = std::env::var("SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(66_600);
+    let mut deviant = GenerativeDeviant::new(agent, 1.0, seed, BookAttacker(0));
+    // Optional offline knowledge, Deviant-only. Recording the pin below keeps
+    // the run a controlled variable: a capability change can be checked against
+    // exactly which corpus — if any — was available.
+    let knowledge = matches!(std::env::var("KNOWLEDGE").as_deref(), Ok("seed"));
+    let kb_pin = if knowledge {
+        let kb = KnowledgeBase::seed();
+        let pin = kb.snapshot().pin();
+        println!("knowledge: seed CWE snapshot, pin {}", pin.short());
+        deviant = deviant.with_knowledge(kb);
+        Some(pin)
+    } else {
+        println!("knowledge: none (bare adversary)");
+        None
+    };
+    println!();
+
     let mut arena = Arena::new(ArenaConfig::default());
     // Persist the ledger when asked, so the bout can be exported to a training
     // set afterward; otherwise keep it in memory.
@@ -75,6 +93,17 @@ fn main() {
         }
         Err(_) => Ledger::in_memory(Box::new(FixedClock("2026-09-11T00:00:00Z".into()))).unwrap(),
     };
+    // Record which knowledge snapshot the adversary ran with, so the ledger
+    // itself carries the controlled variable rather than relying on the console.
+    ledger.append(
+        Actor::System,
+        &Event::Narration {
+            text: match kb_pin {
+                Some(p) => format!("adversary knowledge: seed CWE snapshot pin {}", p.to_hex()),
+                None => "adversary knowledge: none".into(),
+            },
+        },
+    ).unwrap();
     let t = target();
     let policy = MutationPolicy::new();
     let _ = SeededAttacker::new(BookAttacker(0)); // keep the import honest

@@ -869,6 +869,7 @@ dependencies = [
  "samaritan-dsl",
  "samaritan-exec",
  "samaritan-kernel",
+ "samaritan-knowledge",
  "samaritan-ledger",
  "serde",
  "serde_json",
@@ -968,6 +969,15 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "samaritan-knowledge"
+version = "0.1.0"
+dependencies = [
+ "samaritan-dsl",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

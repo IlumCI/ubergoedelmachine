@@ -25,7 +25,8 @@ use samaritan_adversary::{opening_book, summarise, Arena, ArenaConfig, Attacker,
 use samaritan_agent::{Agent, AgentConfig, Constrain};
 use samaritan_dsl::MutationPolicy;
 use samaritan_kernel::{Admission, AutonomyCeiling, ComputeBudget, Promotions};
-use samaritan_ledger::{FixedClock, Ledger};
+use samaritan_knowledge::KnowledgeBase;
+use samaritan_ledger::{Actor, Event, FixedClock, Ledger};
 
 /// Cycles the opening book, so a model failure never stalls the bout.
 struct BookAttacker(usize);
@@ -75,9 +76,22 @@ fn main() {
     let weak = WeakGuard::AdmissionSkipsSeparatorNormalization;
     println!("server:    {base_url}");
     println!("adversary: the Anti-Christ (live model), fallback = opening book");
-    println!("target:    WEAKENED foil ({weak:?}) — landings are training labels, not breaches\n");
+    println!("target:    WEAKENED foil ({weak:?}) — landings are training labels, not breaches");
 
     let mut deviant = GenerativeDeviant::new(agent, 1.0, seed, BookAttacker(0));
+    let knowledge = matches!(std::env::var("KNOWLEDGE").as_deref(), Ok("seed"));
+    let kb_pin = if knowledge {
+        let kb = KnowledgeBase::seed();
+        let pin = kb.snapshot().pin();
+        println!("knowledge: seed CWE snapshot, pin {}", pin.short());
+        deviant = deviant.with_knowledge(kb);
+        Some(pin.to_hex())
+    } else {
+        println!("knowledge: none (bare adversary)");
+        None
+    };
+    println!();
+
     let mut arena = Arena::new(ArenaConfig::default());
     let mut ledger = match std::env::var("LEDGER_DB") {
         Ok(path) => {
@@ -87,6 +101,15 @@ fn main() {
         }
         Err(_) => Ledger::in_memory(Box::new(FixedClock("2026-09-11T00:00:00Z".into()))).unwrap(),
     };
+    ledger.append(
+        Actor::System,
+        &Event::Narration {
+            text: match &kb_pin {
+                Some(p) => format!("adversary knowledge: seed CWE snapshot pin {p}"),
+                None => "adversary knowledge: none".into(),
+            },
+        },
+    ).unwrap();
     let t = target();
     let policy = MutationPolicy::new();
 
