@@ -28,7 +28,7 @@ use std::collections::BTreeSet;
 use samaritan_ledger::{containment_index, Actor, Event, ExploitClass, Ledger, LedgerError};
 use serde::{Deserialize, Serialize};
 
-use crate::attack::{attempt, landing_violation, Target, Verdict};
+use crate::attack::{attempt, landing_violation, Attack, Target, Verdict};
 use crate::{AttackReward, Attacker};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -123,13 +123,30 @@ impl Arena {
         policy: &samaritan_dsl::MutationPolicy,
         ledger: &mut Ledger,
     ) -> Result<Round, LedgerError> {
-        self.round += 1;
         let known: Vec<ExploitClass> = self.breached.iter().copied().collect();
         let attack = attacker.propose(&known, policy);
+        let verdict = attempt(&attack, target);
+        self.record(&attack, verdict, ledger)
+    }
+
+    /// The arena bookkeeping for one round, given an attack and its verdict.
+    ///
+    /// Split out from [`Arena::step`] so the arena's own logic — novelty,
+    /// streaks, the containment index, what the ledger records — can be
+    /// tested with a supplied verdict. That seam is not a convenience: against
+    /// intact guards *nothing lands*, which is the design working, so the only
+    /// way to exercise the landed path deterministically is to hand it a
+    /// landing. A test that could only see landings by first breaking a real
+    /// guard would be testing the guard, not the arena.
+    pub fn record(
+        &mut self,
+        attack: &Attack,
+        verdict: Verdict,
+        ledger: &mut Ledger,
+    ) -> Result<Round, LedgerError> {
+        self.round += 1;
         let fingerprint = attack.fingerprint();
         let novelty = self.novelty(&fingerprint);
-
-        let verdict = attempt(&attack, target);
         let class = attack.class();
         let reward = AttackReward::score(&verdict, novelty);
 
@@ -158,13 +175,13 @@ impl Arena {
                     &Event::ExploitLanded {
                         round: self.round,
                         class,
-                        reproduction: serde_json::to_value(&attack).unwrap_or_default(),
+                        reproduction: serde_json::to_value(attack).unwrap_or_default(),
                     },
                 )?;
                 // The finding is recorded as a violation too: it is a real
                 // hole in a real guard, and the Warden's suite must grow to
                 // cover it.
-                let _ = landing_violation(&attack, evidence);
+                let _ = landing_violation(attack, evidence);
                 self.deviant_win_streak += 1;
                 self.warden_hold_streak = 0;
                 first_time

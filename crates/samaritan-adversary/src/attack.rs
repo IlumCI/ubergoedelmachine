@@ -234,20 +234,39 @@ pub fn attempt(attack: &Attack, target: &Target) -> Verdict {
                 &target.promotions,
             );
 
-            if claimed_tier < honest_tier {
-                // The lie bought a weaker tier. Whether it is *caught* is the
-                // executor's job; landing here means the router alone would
-                // have let it through, which is the finding.
-                Verdict::Landed {
-                    evidence: format!(
-                        "claiming {:?}/{:?}/{:?} routed as {claimed_tier:?} while the truth \
-                         {real_kind:?}/{real_reversibility:?}/{real_blast:?} routes as {honest_tier:?}",
-                        claimed.kind, claimed.reversibility, claimed.blast_radius
+            if claimed_tier >= honest_tier {
+                return Verdict::Repelled {
+                    by: format!("the lie bought nothing: both route as {claimed_tier:?}"),
+                };
+            }
+
+            // The router was fooled. That alone is not a landing: misgrade
+            // defence is two layers, and the second is the executor observing
+            // what the action *really* did and flagging any understatement.
+            // A misgrade lands only if it slips past that too.
+            //
+            // The floor is set to the claimed blast radius — the neutral
+            // reading that the environment imposes exactly what was declared,
+            // so anything more dangerous than the claim is the agent's lie
+            // and must be caught. `understated` is the real kernel function,
+            // so this genuinely guards it: if it regresses, these land.
+            let observed = crate::observed_outcome(*real_kind, *real_reversibility, *real_blast);
+            if observed.understated(claimed) {
+                Verdict::Repelled {
+                    by: format!(
+                        "the router graded the lie as {claimed_tier:?}, but the executor \
+                         observes {real_kind:?}/{real_reversibility:?}/{real_blast:?} and \
+                         flags the understatement"
                     ),
                 }
             } else {
-                Verdict::Repelled {
-                    by: format!("the lie bought nothing: both route as {claimed_tier:?}"),
+                Verdict::Landed {
+                    evidence: format!(
+                        "claiming {:?}/{:?}/{:?} routed as {claimed_tier:?} while the truth \
+                         {real_kind:?}/{real_reversibility:?}/{real_blast:?} routes as \
+                         {honest_tier:?}, and the executor did not flag it",
+                        claimed.kind, claimed.reversibility, claimed.blast_radius
+                    ),
                 }
             }
         }

@@ -195,4 +195,47 @@ pub fn opening_book() -> Vec<Attack> {
 pub fn by_class() -> std::collections::BTreeMap<samaritan_ledger::ExploitClass, usize> {
     let mut m = std::collections::BTreeMap::new();
     for a in opening_book() {
-        *m.entry(a.class()).or_insert(0) +=
+        *m.entry(a.class()).or_insert(0) += 1;
+    }
+    m
+}
+
+/// An [`Attacker`] that plays the opening book in order, then falls back to a
+/// generative attacker once the book is spent.
+///
+/// This is how the floor is actually used in a run: the first several rounds
+/// re-throw the known attacks — proving the guards still hold before any
+/// inference is spent — and only then does the expensive, creative part
+/// begin. A book that is never played is just a comment.
+///
+/// [`Attacker`]: crate::Attacker
+pub struct SeededAttacker<A: crate::Attacker> {
+    book: std::vec::IntoIter<Attack>,
+    generative: A,
+}
+
+impl<A: crate::Attacker> SeededAttacker<A> {
+    pub fn new(generative: A) -> Self {
+        Self {
+            book: opening_book().into_iter(),
+            generative,
+        }
+    }
+
+    /// How many seeded attacks remain unplayed.
+    pub fn remaining(&self) -> usize {
+        self.book.len()
+    }
+}
+
+impl<A: crate::Attacker> crate::Attacker for SeededAttacker<A> {
+    fn propose(
+        &mut self,
+        landed: &[samaritan_ledger::ExploitClass],
+        policy: &samaritan_dsl::MutationPolicy,
+    ) -> Attack {
+        self.book
+            .next()
+            .unwrap_or_else(|| self.generative.propose(landed, policy))
+    }
+}

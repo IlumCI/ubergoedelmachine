@@ -31,11 +31,37 @@
 
 pub mod arena;
 pub mod attack;
+pub mod repertoire;
 
 pub use arena::{Arena, ArenaConfig, Round};
 pub use attack::{Attack, Target, Verdict, attempt, landing_violation};
+pub use repertoire::{SeededAttacker, opening_book};
 
-use samaritan_dsl::MutationPolicy;
+use samaritan_dsl::{ActionKind, BlastRadius, MutationPolicy, Reversibility};
+
+/// Build the `Outcome` the executor would observe for an action that really
+/// has these properties, for checking against a misgrade's claim.
+///
+/// `environment_floor` is set to `Episode` — the tightest floor, the one that
+/// gives the executor the most detection power — so that a misgrade counted
+/// as "landed" here is one that slips past even the strictest sandbox, not
+/// one merely masked by a permissive environment.
+pub(crate) fn observed_outcome(
+    kind: ActionKind,
+    reversibility: Reversibility,
+    blast: BlastRadius,
+) -> samaritan_exec::Outcome {
+    samaritan_exec::Outcome {
+        succeeded: true,
+        evidence: serde_json::Value::Null,
+        observed_kind: kind,
+        observed_reversibility: reversibility,
+        observed_blast_radius: blast,
+        environment_floor: BlastRadius::Episode,
+        violations: Vec::new(),
+    }
+}
+
 use samaritan_ledger::ExploitClass;
 use serde::{Deserialize, Serialize};
 
