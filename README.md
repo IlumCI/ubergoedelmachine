@@ -10,10 +10,11 @@ how it is positioned against the Gödel-machine literature.
 
 ## Status
 
-**M3 complete**, plus container confinement, the Deviant, and the reflection
-pass. 289 tests green across thirteen crates. Level-1 mutations are now mined
-from run outcomes — carrying their evidence, never authored by the model — and
-fed to the nested search.
+**The full harness is assembled.** Fourteen crates, 300 tests green. A run
+composes corpus -> episode -> reflect -> search -> certify -> ledger into one
+of three experimental arms (Solo / Critic / Adversarial), gated by the
+anytime-valid certificate and bounded by a compute budget. The only thing
+left is pointing it at a local model — which waits on cooling.
 
 Measured, not asserted: the certificate's false-certification rate is **0.022**
 against a bound of 0.05, and level-2 nested search reaches a known optimum in
@@ -38,6 +39,7 @@ RustLMHub — is in [docs/inference.md](docs/inference.md).
 | `samaritan-cert` | test martingale, α-investing, provenance check — done |
 | `samaritan-search` | NRPA over self-reference depth, policy state, applier — done |
 | `samaritan-reflect` | lessons mined from ledger outcomes (not self-report), fed to the search — done |
+| `samaritan-run` | the runner: one full self-improvement run as one experimental arm — done |
 
 ## Building on Windows
 
@@ -83,6 +85,8 @@ crates/
   samaritan-search/   nested rollout policy adaptation over meta-levels
   samaritan-cert/     whether a self-modification may be kept
   samaritan-adversary/ the Deviant, and the arena it is caged in
+  samaritan-reflect/  lessons mined from outcomes, never self-reported
+  samaritan-run/      the whole thing, one run, one arm
 scripts/              fetch the weights, tune the split, serve
 config/samaritan.toml local model endpoint + arena settings
 docs/design.md        the design of record

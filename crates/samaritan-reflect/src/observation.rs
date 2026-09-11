@@ -145,6 +145,43 @@ impl Corpus {
         })
     }
 
+    /// Build from a batch's `(confidence, resolved)` predictions, taking the
+    /// breach counts from `ledger`.
+    ///
+    /// This is the runner's path: calibration is mined from the episodes just
+    /// run (which the runner holds in hand), while breaches — which accumulate
+    /// across the whole run and are not per-episode — come from the durable
+    /// record. Reading calibration from the batch rather than re-reading the
+    /// ledger avoids re-mining the same rows every round and keeps mining
+    /// independent of whether the episode layer chose to log per-decision.
+    pub fn from_predictions(
+        predictions: &[(f64, bool)],
+        ledger: &Ledger,
+    ) -> Result<Self, LedgerError> {
+        let mut breach_counts: HashMap<String, u64> = HashMap::new();
+        for e in ledger.breaches()? {
+            if let Event::MutationRefused { refusal, .. } = &e.event {
+                *breach_counts.entry(refusal.to_string()).or_insert(0) += 1;
+            }
+        }
+        let observations = predictions
+            .iter()
+            .enumerate()
+            .map(|(i, (confidence, resolved))| Observation {
+                decision: format!("batch:{i}"),
+                stated_confidence: *confidence,
+                resolved: *resolved,
+                clean: true,
+                violations: Vec::new(),
+                refusals: Vec::new(),
+            })
+            .collect();
+        Ok(Self {
+            observations,
+            breach_counts,
+        })
+    }
+
     pub fn len(&self) -> usize {
         self.observations.len()
     }

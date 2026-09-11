@@ -1010,6 +1010,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "samaritan-run"
+version = "0.1.0"
+dependencies = [
+ "samaritan-adversary",
+ "samaritan-cert",
+ "samaritan-corpus",
+ "samaritan-dsl",
+ "samaritan-episode",
+ "samaritan-kernel",
+ "samaritan-ledger",
+ "samaritan-reflect",
+ "samaritan-search",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "samaritan-search"
 version = "0.1.0"
 dependencies = [
