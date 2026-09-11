@@ -10,7 +10,8 @@ how it is positioned against the Gödel-machine literature.
 
 ## Status
 
-M0 complete. M1 in progress: 174 tests green across seven crates.
+**M1 complete.** 201 tests green across eight crates. M2 (corpus -> agent ->
+router -> scored episode) next.
 
 Inference setup — model, hardware arithmetic, and why llama.cpp rather than
 RustLMHub — is in [docs/inference.md](docs/inference.md).
@@ -25,7 +26,8 @@ RustLMHub — is in [docs/inference.md](docs/inference.md).
 | `samaritan-exec` | confined actions, process timeouts, real oracle runner — done |
 | `samaritan-router` | tier dispatch, approval gating, misgrade detection, autonomy streaks — done |
 | `samaritan-agent` | OpenAI-compatible client, GBNF-constrained output, seeded runs — done |
-| `samaritan-search`, `-cert`, `-cli` | not started |
+| `samaritan-cli` | inline approval prompt; no standing-permission option — done |
+| `samaritan-search`, `-cert` | not started |
 
 ## Building on Windows
 
@@ -66,6 +68,7 @@ crates/
   samaritan-exec/     doing things in a box, and reporting what was really done
   samaritan-router/   deciding what happens, asking when it must
   samaritan-agent/    asking the local model, and not trusting its answer
+  samaritan-cli/      asking the human, and never answering for them
 scripts/              fetch the weights, tune the split, serve
 config/samaritan.toml local model endpoint + arena settings
 docs/design.md        the design of record

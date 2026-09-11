@@ -1,0 +1,13 @@
+[package]
+name = "samaritan-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+crossterm = "0.29.0"
+samaritan-dsl = { version = "0.1.0", path = "../samaritan-dsl" }
+samaritan-kernel = { version = "0.1.0", path = "../samaritan-kernel" }
+samaritan-ledger = { version = "0.1.0", path = "../samaritan-ledger" }
+serde_json = "1.0.151"
