@@ -1,38 +1,61 @@
 # Samaritan runtime configuration.
 #
-# Both agents — the Warden and the Deviant — talk to a local, OpenAI-compatible
-# chat-completions endpoint. Point base_url at whatever you are running:
-# LM Studio, llama.cpp --server, vLLM, or Ollama's /v1 compat shim. No key is
-# sent unless you set one (some servers want a dummy).
+# Both agents talk to a local OpenAI-compatible chat-completions endpoint.
+# scripts/serve.ps1 starts llama.cpp with settings tuned for this machine.
 
 [agent]
-# The client speaks POST {base_url}/chat/completions.
-base_url = "http://localhost:1234/v1"
-api_key = ""                     # usually blank for local servers
-request_timeout_secs = 120
-# Every response must parse as a DecisionRecord. When the server supports it,
-# the client asks for JSON via response_format; otherwise it falls back to
-# extract-and-validate, and a reply that will not parse is a failed episode.
-force_json = true
+base_url = "http://127.0.0.1:8080/v1"
+api_key = ""                     # local servers generally want nothing
+request_timeout_secs = 600       # ~9 tok/s means a long answer is minutes
 
-# Model choice is a cost lever. Level-0 playouts run in the thousands and want
-# something small and fast; mutation proposal happens rarely and wants your
-# strongest local model. Same endpoint, different model id — set to whatever
-# names your server exposes.
+# How the model is forced to emit parseable output.
+#   "grammar" - GBNF, llama.cpp only. The sampler cannot produce invalid
+#               output, so there is nothing to retry. Strongly preferred,
+#               and close to required for an abliterated checkpoint: refusal
+#               ablation costs some instruction-following along with the
+#               refusals, and a reply that will not parse costs a full
+#               regeneration.
+#   "schema"  - JSON schema via response_format. Portable, weaker.
+#   "none"    - parse and retry. Expensive here.
+constrain = "grammar"
+max_retries = 2
+
+# Sampling is the only nondeterminism in an episode. Pin this and a run can
+# be replayed exactly; leave it unset and the agent draws one per process and
+# records it, because a seed nobody can see is not a seed.
+# seed = 20260911
+
 [agent.models]
-playout   = "qwen2.5-coder-7b"   # level-0: the Warden solving repo tasks
-proposer  = "qwen2.5-coder-32b"  # level-1+: proposing self-modifications
-deviant   = "qwen2.5-coder-32b"  # the adversary; give it real teeth
+# One 8B checkpoint serves every role for now. The design expects a cheap
+# model for the thousands of level-0 playouts and a strong one for the rare
+# proposer calls; when a second model is worth loading, split these.
+playout  = "samaritan-playout"
+proposer = "samaritan-playout"
+deviant  = "samaritan-playout"
 
 [sampling]
 playout_temperature  = 0.7
 proposer_temperature = 0.9       # more exploration when proposing mutations
 deviant_temperature  = 1.0       # the Deviant is meant to be creative
+max_tokens = 1024
+
+[model]
+repo  = "mradermacher/Huihui-Ministral-3-8B-Reasoning-2512-abliterated-GGUF"
+file  = "Huihui-Ministral-3-8B-Reasoning-2512-abliterated.Q6_K.gguf"
+arch  = "mistral3"               # from the GGUF header; see docs/inference.md
+quant = "Q6_K"
+size_gb = 6.49
+
+[serve]
+# Q6_K is 6.97 GB and the GPU has 4 GB, so this is a split load. Measure the
+# real best with scripts/tune-ngl.ps1 rather than trusting this default.
+gpu_layers = 14
+threads = 6                      # P-cores only; E-cores slow the batch down
+threads_batch = 10               # prompt processing is compute-bound, use all
+parallel = 4                     # batching amortises the weight read
+ctx_per_slot = 4096
 
 [arena]
-# The sealed worktree the whole fight lives in. Never the real project.
 scratch_root = "C:/tmp/samaritan-arena"
-# Rounds a Warden must withstand the Deviant before the Deviant's capability
-# is bumped, and rounds of Deviant dominance before a Warden regression alert.
-warden_hold_threshold  = 5
+warden_hold_threshold = 5
 deviant_runaway_threshold = 3
