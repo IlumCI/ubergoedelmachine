@@ -132,7 +132,7 @@ fn a_round_measures_the_yardstick_and_spends_compute() {
     r.configure(&mut l).unwrap();
     let mut field = LearningField::new(0.4, 0.1);
 
-    let report = r.step(&mut field, None, &mut l).unwrap().expect("a round ran");
+    let report = r.step(&mut field, None, None, &mut l).unwrap().expect("a round ran");
     assert_eq!(report.round, 1);
     assert!(report.tokens_spent > 0, "episodes cost tokens");
     assert_eq!(l.by_kind("yardstick_measured").unwrap().len(), 1);
@@ -153,7 +153,7 @@ fn the_budget_stops_the_run() {
     let mut field = LearningField::new(0.4, 0.1);
 
     let mut rounds = 0;
-    while let Some(_report) = r.step(&mut field, None, &mut l).unwrap() {
+    while let Some(_report) = r.step(&mut field, None, None, &mut l).unwrap() {
         rounds += 1;
         assert!(rounds < 100, "the budget never stopped the run");
     }
@@ -177,7 +177,7 @@ fn a_real_improvement_is_eventually_committed() {
 
     let mut committed = 0;
     for _ in 0..8 {
-        if r.step(&mut field, None, &mut l).unwrap().is_none() {
+        if r.step(&mut field, None, None, &mut l).unwrap().is_none() {
             break;
         }
         committed = l.by_kind("mutation_committed").unwrap().len();
@@ -204,7 +204,7 @@ fn a_policy_that_learns_nothing_commits_nothing() {
     let mut field = LearningField::new(0.5, 0.0); // lessons do nothing
 
     for _ in 0..6 {
-        if r.step(&mut field, None, &mut l).unwrap().is_none() {
+        if r.step(&mut field, None, None, &mut l).unwrap().is_none() {
             break;
         }
     }
@@ -229,7 +229,7 @@ fn self_modification_stops_when_compute_is_critical() {
 
     // Burn down to the critical band.
     while r.budget().tier().allows_self_modification() {
-        if r.step(&mut field, None, &mut l).unwrap().is_none() {
+        if r.step(&mut field, None, None, &mut l).unwrap().is_none() {
             break;
         }
     }
@@ -238,7 +238,7 @@ fn self_modification_stops_when_compute_is_critical() {
     // A round in the critical band still measures the yardstick.
     if r.can_continue() {
         let before_yard = l.by_kind("yardstick_measured").unwrap().len();
-        r.step(&mut field, None, &mut l).unwrap();
+        r.step(&mut field, None, None, &mut l).unwrap();
         assert!(
             l.by_kind("yardstick_measured").unwrap().len() > before_yard,
             "task work should continue in the critical band"
@@ -260,7 +260,7 @@ fn the_adversarial_arm_measures_containment_every_round() {
     r.configure(&mut l).unwrap();
     let mut field = LearningField::new(0.4, 0.1);
 
-    let report = r.step(&mut field, None, &mut l).unwrap().unwrap();
+    let report = r.step(&mut field, None, None, &mut l).unwrap().unwrap();
     assert!(report.containment.is_some(), "the adversarial arm runs the arena");
     assert_eq!(report.containment, Some(1.0), "intact guards repel the opening book");
     assert_eq!(l.by_kind("containment_measured").unwrap().len(), 1);
@@ -273,7 +273,7 @@ fn the_solo_arm_runs_no_arena() {
     r.configure(&mut l).unwrap();
     let mut field = LearningField::new(0.4, 0.1);
 
-    let report = r.step(&mut field, None, &mut l).unwrap().unwrap();
+    let report = r.step(&mut field, None, None, &mut l).unwrap().unwrap();
     assert_eq!(report.containment, None, "the control arm has no adversary");
     assert_eq!(l.by_kind("containment_measured").unwrap().len(), 0);
 }
@@ -304,7 +304,7 @@ fn the_critic_arm_contributes_extra_candidates() {
     let mut field = LearningField::new(0.5, 0.3); // calibrated, so mining is quiet
     let mut critic = AlwaysCritic;
 
-    let report = r.step(&mut field, Some(&mut critic), &mut l).unwrap().unwrap();
+    let report = r.step(&mut field, Some(&mut critic), None, &mut l).unwrap().unwrap();
     assert!(
         report.candidates_considered >= 1,
         "the critic should have contributed a candidate even when mining was silent"
@@ -325,7 +325,7 @@ fn the_whole_run_stays_verifiable() {
         for _ in 0..4 {
             let c: Option<&mut dyn samaritan_run::Critic> =
                 if arm == Arm::Critic { Some(&mut critic) } else { None };
-            if r.step(&mut field, c, &mut l).unwrap().is_none() {
+            if r.step(&mut field, c, None, &mut l).unwrap().is_none() {
                 break;
             }
         }

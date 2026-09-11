@@ -58,7 +58,7 @@ param(
     [int]$Ngl = 18,
     [int]$Port = 8080,
     [string]$ModelDir = "$env:USERPROFILE\models",
-    [int]$Parallel = 4,
+    [int]$Parallel = 2,   # dialled down after a thermal scare; raise once cooling is proven
     [int]$CtxPerSlot = 4096
 )
 

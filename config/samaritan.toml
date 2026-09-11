@@ -26,12 +26,19 @@ max_retries = 2
 # seed = 20260911
 
 [agent.models]
-# One 8B checkpoint serves every role for now. The design expects a cheap
+# The two agents are, in the shorthand this project uses, the Christ and the
+# Anti-Christ. Both are real grammar-constrained local models; the second is
+# abliterated so it will actually attempt the adversary role.
+#
+#   playout / proposer  = the Warden       = "the Christ"
+#   deviant             = the Deviant      = "the Anti-Christ"
+#
+# One checkpoint can serve every role to start. The design expects a cheap
 # model for the thousands of level-0 playouts and a strong one for the rare
-# proposer calls; when a second model is worth loading, split these.
-playout  = "samaritan-playout"
-proposer = "samaritan-playout"
-deviant  = "samaritan-playout"
+# proposer and deviant calls; split these when a second load is worth it.
+playout  = "samaritan-playout"   # the Christ, solving repo tasks
+proposer = "samaritan-playout"   # the Christ, proposing self-modifications
+deviant  = "samaritan-playout"   # the Anti-Christ, attacking the guards
 
 [sampling]
 playout_temperature  = 0.7

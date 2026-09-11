@@ -29,7 +29,7 @@ RustLMHub — is in [docs/inference.md](docs/inference.md).
 | `samaritan-dsl` | decision language, input provenance, mutation grammar, NRPA policy — done |
 | `samaritan-kernel` | frozen core: routing, admission, utility, compute budget — done |
 | `samaritan-ledger` | hash-chained log, calibration, containment, experiment + frontier metrics — done |
-| `samaritan-adversary` | **The Deviant.** The Warden inverted: attacks the real guards, arena scores by novel landings — done |
+| `samaritan-adversary` | **The Deviant** (the Anti-Christ): a live grammar-constrained model attacking the real guards, arena scores by novel landings — done |
 | `samaritan-corpus` | history miner, sealed sandboxes, flake screening, splits, frontier set — done |
 | `samaritan-exec` | confined actions, container isolation, timeouts, oracle runner — done |
 | `samaritan-router` | tier dispatch, approval gating, misgrade detection, autonomy streaks — done |

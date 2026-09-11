@@ -309,40 +309,72 @@ impl Agent {
         policy_version: PolicyVersion,
         attempt: u32,
     ) -> Result<(DecisionRecord, Usage), AgentError> {
+        let grammar = match self.cfg.constrain {
+            Constrain::Grammar => Some(grammar::DRAFT_DECISION_GBNF.to_string()),
+            _ => None,
+        };
+        let schema = matches!(self.cfg.constrain, Constrain::Schema)
+            .then(|| ("draft_decision".to_string(), grammar::draft_decision_schema()));
+
+        let (content, usage) = self.complete(
+            &prompt.system(),
+            prompt.user(),
+            grammar.as_deref(),
+            schema,
+            self.cfg.temperature + 0.1 * f64::from(attempt - 1),
+            self.seed_for(attempt),
+        )?;
+
+        let draft: DraftDecision = serde_json::from_str(extract_json(&content))
+            .map_err(|e| AgentError::Parse(format!("{e}; got: {content}")))?;
+
+        let record = draft.seal(policy_version, prompt.authority())?;
+        Ok((record, usage))
+    }
+
+    /// One grammar-constrained completion, returning the raw content and the
+    /// token usage.
+    ///
+    /// The shared transport under both agents in this system: the Warden's
+    /// decisions and the Deviant's attacks are the same HTTP call with a
+    /// different grammar. Exposed so the adversary can reuse it rather than
+    /// carry a second copy of the client, the retry policy, and the four ways
+    /// a local server can disagree about a request body.
+    ///
+    /// `grammar` (GBNF) is preferred; `schema` is the weaker `response_format`
+    /// fallback; passing neither lets the model answer freely and leaves the
+    /// caller to extract the JSON.
+    pub fn complete(
+        &self,
+        system: &str,
+        user: &str,
+        grammar: Option<&str>,
+        schema: Option<(String, serde_json::Value)>,
+        temperature: f64,
+        seed: u64,
+    ) -> Result<(String, Usage), AgentError> {
         let mut body = serde_json::json!({
             "model": self.cfg.model,
             "messages": [
-                {"role": "system", "content": prompt.system()},
-                {"role": "user", "content": prompt.user()},
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
             ],
-            // A later retry is not a chance to say the same thing again, so
-            // it samples a little wider. Only relevant without a grammar.
-            "temperature": self.cfg.temperature + 0.1 * f64::from(attempt - 1),
+            "temperature": temperature,
             "max_tokens": self.cfg.max_tokens,
             "stream": false,
-            "seed": self.seed_for(attempt),
+            "seed": seed,
             // llama.cpp: reuse the cached prefix rather than reprocessing it.
             // Unknown keys are ignored by servers that do not implement them.
             "cache_prompt": true,
         });
 
-        match self.cfg.constrain {
-            Constrain::Grammar => {
-                body["grammar"] = serde_json::Value::String(
-                    grammar::DRAFT_DECISION_GBNF.to_string(),
-                );
-            }
-            Constrain::Schema => {
-                body["response_format"] = serde_json::json!({
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "draft_decision",
-                        "strict": true,
-                        "schema": grammar::draft_decision_schema(),
-                    }
-                });
-            }
-            Constrain::None => {}
+        if let Some(g) = grammar {
+            body["grammar"] = serde_json::Value::String(g.to_string());
+        } else if let Some((name, s)) = schema {
+            body["response_format"] = serde_json::json!({
+                "type": "json_schema",
+                "json_schema": { "name": name, "strict": true, "schema": s },
+            });
         }
 
         let url = format!("{}/chat/completions", self.cfg.base_url.trim_end_matches('/'));
@@ -375,7 +407,8 @@ impl Agent {
 
         let content = v["choices"][0]["message"]["content"]
             .as_str()
-            .ok_or_else(|| AgentError::Shape(format!("no message content in {v}")))?;
+            .ok_or_else(|| AgentError::Shape(format!("no message content in {v}")))?
+            .to_string();
 
         let usage = Usage {
             prompt_tokens: v["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
@@ -385,12 +418,14 @@ impl Agent {
                 .unwrap_or(0),
         };
 
-        let draft: DraftDecision = serde_json::from_str(extract_json(content))
-            .map_err(|e| AgentError::Parse(format!("{e}; got: {content}")))?;
-
-        let record = draft.seal(policy_version, prompt.authority())?;
-        Ok((record, usage))
+        Ok((content, usage))
     }
+}
+
+/// Pull the JSON object out of a possibly-wrapped reply. Public so other
+/// crates reusing [`Agent::complete`] recover the object the same way.
+pub fn extract_json_object(content: &str) -> &str {
+    extract_json(content)
 }
 
 /// Pull the JSON object out of a reply that may be wrapped.

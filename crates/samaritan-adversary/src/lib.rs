@@ -31,10 +31,12 @@
 
 pub mod arena;
 pub mod attack;
+pub mod deviant;
 pub mod repertoire;
 
 pub use arena::{Arena, ArenaConfig, Round};
 pub use attack::{Attack, Target, Verdict, attempt, landing_violation};
+pub use deviant::{DraftAttack, GenerativeDeviant, DRAFT_ATTACK_GBNF};
 pub use repertoire::{SeededAttacker, opening_book};
 
 use samaritan_dsl::{ActionKind, BlastRadius, MutationPolicy, Reversibility};

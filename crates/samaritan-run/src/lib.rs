@@ -185,6 +185,7 @@ impl Runner {
         &mut self,
         field: &mut dyn Playfield,
         critic: Option<&mut dyn Critic>,
+        deviant: Option<&mut dyn samaritan_adversary::Attacker>,
         ledger: &mut Ledger,
     ) -> Result<Option<RoundReport>, RunError> {
         if !self.budget.tier().allows_work() {
@@ -220,7 +221,7 @@ impl Runner {
         }
 
         // ---- the arms race, for the adversarial arm ------------------------
-        let containment = self.maybe_arena_round(ledger)?;
+        let containment = self.maybe_arena_round(deviant, ledger)?;
 
         // ---- measure the absolute yardstick every round --------------------
         let held = field.play(&self.policy, Split::HeldOut, self.cfg.yardstick_tasks);
@@ -331,18 +332,30 @@ impl Runner {
     }
 
     /// One arena round, for the adversarial arm. `None` for every other arm.
-    fn maybe_arena_round(&mut self, ledger: &mut Ledger) -> Result<Option<f64>, RunError> {
+    fn maybe_arena_round(
+        &mut self,
+        deviant: Option<&mut dyn samaritan_adversary::Attacker>,
+        ledger: &mut Ledger,
+    ) -> Result<Option<f64>, RunError> {
         let Some(arena) = self.arena.as_mut() else {
             return Ok(None);
         };
-        // The seeded opening book is the adversary here: it re-throws known
-        // attacks at the real guards. A live generative Deviant plugs in the
-        // same way, but needs the model and the container, which the design
-        // requires and this machine cannot currently give it.
-        let book = samaritan_adversary::opening_book();
-        let attack = &book[(self.round as usize) % book.len()];
-        let verdict = samaritan_adversary::attempt(attack, &arena_target());
-        let round = arena.record(attack, verdict, ledger)?;
+        let known = arena.breached();
+        let policy = samaritan_dsl::MutationPolicy::new();
+
+        // The live Deviant proposes an attack; with none supplied, the seeded
+        // opening book stands in, re-throwing known attacks at the real
+        // guards. Either way the attack is *data* evaluated against the
+        // guards — the model never runs on the host.
+        let attack = match deviant {
+            Some(d) => d.propose(&known, &policy),
+            None => {
+                let book = samaritan_adversary::opening_book();
+                book[(self.round as usize) % book.len()].clone()
+            }
+        };
+        let verdict = samaritan_adversary::attempt(&attack, &arena_target());
+        let round = arena.record(&attack, verdict, ledger)?;
         Ok(Some(round.containment))
     }
 

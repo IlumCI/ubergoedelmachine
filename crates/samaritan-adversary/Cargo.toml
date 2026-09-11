@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+samaritan-agent = { version = "0.1.0", path = "../samaritan-agent" }
 samaritan-dsl = { version = "0.1.0", path = "../samaritan-dsl" }
 samaritan-exec = { version = "0.1.0", path = "../samaritan-exec" }
 samaritan-kernel = { version = "0.1.0", path = "../samaritan-kernel" }
