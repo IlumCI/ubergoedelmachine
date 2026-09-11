@@ -100,16 +100,23 @@ impl Prompt {
         self
     }
 
-    /// Band 3, content read out of the environment.
+    /// Band 3, content read back out of the environment.
     ///
-    /// This is the call that taints the decision. File contents, stdout and
-    /// error text are all writable by an adversary sharing the arena, so
-    /// anything downstream of this can never run unattended — see
-    /// [`Authority::Observed`] and `samaritan_kernel::route`.
-    pub fn with_observation(mut self, label: &str, content: &str) -> Self {
+    /// `source` is who could have authored these bytes, and the caller has to
+    /// say rather than have it assumed. In a sealed solo episode the content
+    /// is corpus- or agent-authored, so [`Authority::Agent`] is correct; in
+    /// an arena the Deviant can write files and emit test output, so it is
+    /// [`Authority::Observed`] and nothing downstream runs unattended.
+    ///
+    /// Defaulting to `Observed` would be the safe-*looking* choice and the
+    /// wrong one. Every action after the first read would need a human, an
+    /// unattended run would become impossible, and the rule would be switched
+    /// off wholesale by whoever hit that wall first — which is how a real
+    /// protection gets traded for a nominal one.
+    pub fn with_observation(mut self, label: &str, content: &str, source: Authority) -> Self {
         self.episode
             .push_str(&format!("\n\n{}:\n{}\n", label.trim(), content.trim()));
-        self.authority = self.authority.least(Authority::Observed);
+        self.authority = self.authority.least(source);
         self
     }
 

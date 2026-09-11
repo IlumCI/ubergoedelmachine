@@ -908,6 +908,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "samaritan-episode"
+version = "0.1.0"
+dependencies = [
+ "samaritan-agent",
+ "samaritan-corpus",
+ "samaritan-dsl",
+ "samaritan-exec",
+ "samaritan-kernel",
+ "samaritan-ledger",
+ "samaritan-router",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "samaritan-exec"
 version = "0.1.0"
 dependencies = [

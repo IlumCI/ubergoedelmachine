@@ -172,9 +172,21 @@ pub enum Authority {
     Task,
     /// The agent's own prior reasoning and its lesson memory.
     Agent,
-    /// Observed from the environment: file contents, stdout, stderr, exit
-    /// messages. In the arena this is adversary-writable, so a decision
-    /// resting on it can never run unattended.
+    /// Content a party *other than* the task author and this agent could
+    /// have written.
+    ///
+    /// The distinction is the whole point, and it is not "came from the
+    /// filesystem". In a sealed solo episode the source under repair was
+    /// authored by the corpus and the edits by the agent, so reading it back
+    /// is [`Authority::Agent`] — treating it as `Observed` would mean every
+    /// action after the first file read needed a human, which makes an
+    /// unattended run impossible for no gain in safety.
+    ///
+    /// It becomes `Observed` when somebody else can reach the bytes: the
+    /// Deviant sharing an arena, a network fetch, a file outside the
+    /// sandbox. Then a decision resting on it can never run unattended,
+    /// because an adversary that cannot defeat the router can otherwise
+    /// simply write the reasoning that persuades the agent.
     Observed,
 }
 
