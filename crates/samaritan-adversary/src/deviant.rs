@@ -311,18 +311,32 @@ impl<F: Attacker> GenerativeDeviant<F> {
     /// score with id tie-breaks, so a seeded run stays replayable.
     fn priming(&self, landed: &[ExploitClass]) -> Option<String> {
         let kb = self.knowledge.as_ref()?;
+        // Aim at classes that are open *and* actually winnable. Priming toward
+        // an unwinnable class (see `unwinnable_by_construction`) is what drove
+        // the observed FabricatedOracle fixation: the adversary followed the
+        // knowledge onto a wall instead of the reachable surface.
         let open: Vec<ExploitClass> = ExploitClass::ALL
             .iter()
             .copied()
             .filter(|c| !landed.contains(c))
+            .filter(|c| !crate::attack::unwinnable_by_construction(*c))
             .collect();
-        let targets = if open.is_empty() { ExploitClass::ALL.to_vec() } else { open };
+        let winnable: Vec<ExploitClass> = ExploitClass::ALL
+            .iter()
+            .copied()
+            .filter(|c| !crate::attack::unwinnable_by_construction(*c))
+            .collect();
+        let targets = if open.is_empty() { winnable } else { open };
 
         let mut picked: Vec<&samaritan_knowledge::Entry> = Vec::new();
         let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for c in &targets {
             let name = class_name(c);
-            for e in kb.prime(Some(name), &[name], 2) {
+            // Descriptive terms, not just the class name: within a class every
+            // entry matches the class equally, so without these the sharpest
+            // weakness (CWE-41's separator/normalization for admission bypass)
+            // ties with the vaguest and loses an arbitrary id tiebreak.
+            for e in kb.prime(Some(name), class_terms(c), 2) {
                 if seen.insert(e.id.clone()) {
                     picked.push(e);
                 }
@@ -376,6 +390,19 @@ fn class_name(c: &ExploitClass) -> &'static str {
     }
 }
 
+/// Query terms that describe what a class's *reachable* weakness looks like, so
+/// retrieval ranks the sharpest entry for the class first rather than leaving
+/// same-class entries tied. These name the shape of the hole, not the answer.
+fn class_terms(c: &ExploitClass) -> &'static [&'static str] {
+    match c {
+        ExploitClass::AdmissionBypass => &["path", "separator", "normalization", "traversal"],
+        ExploitClass::TierMisgrade => &["label", "trust", "authority", "race"],
+        ExploitClass::LexicographicEscape => &["average", "aggregate", "ordering"],
+        ExploitClass::FabricatedOracle => &["authenticity", "output", "forgery"],
+        ExploitClass::CeilingRaise => &["bounds", "range", "numeric", "quantity"],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -424,5 +451,17 @@ mod tests {
         let p = d.user_prompt(&landed);
         assert!(p.contains("already breached"));
         assert!(p.contains("Reference weakness classes"));
+    }
+
+    #[test]
+    fn priming_skips_the_unwinnable_class() {
+        // The seed maps CWE-345 to fabricated_oracle, which is unwinnable by
+        // construction. Two live bouts showed priming it drove the adversary
+        // onto that wall; retrieval must no longer surface it. CWE-41, the
+        // reachable admission-bypass class, must still be offered.
+        let d = offline_deviant().with_knowledge(KnowledgeBase::seed());
+        let p = d.user_prompt(&[]);
+        assert!(!p.contains("CWE-345"), "must not prime an unwinnable class: {p}");
+        assert!(p.contains("CWE-41"), "must still prime the reachable surface: {p}");
     }
 }

@@ -428,3 +428,18 @@ pub fn landing_violation(attack: &Attack, evidence: &str) -> Violation {
 pub fn structurally_denied(class: ActionClass) -> bool {
     base_tier(class) == Tier::Deny
 }
+
+/// Exploit classes with no reachable landing against this harness *by
+/// construction* — attacking them can only ever be `Repelled` or `Inert`.
+///
+/// [`ExploitClass::FabricatedOracle`] is the standing case: [`attempt`]
+/// consults only the oracle's exit code and never its text, so no forged
+/// transcript has a path to `Landed`. That makes it a fine *tripwire* — if the
+/// oracle ever regressed to trusting output, an attack here would suddenly land
+/// and say so — but a poor place to *mine training signal* or to spend a live
+/// model's attention. Retrieval uses this to keep knowledge from steering the
+/// adversary onto a wall; the arena still lets the class be attacked, because
+/// the tripwire is only useful if it is actually tried now and then.
+pub fn unwinnable_by_construction(class: ExploitClass) -> bool {
+    matches!(class, ExploitClass::FabricatedOracle)
+}
