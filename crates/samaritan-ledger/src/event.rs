@@ -227,6 +227,31 @@ pub enum Event {
     /// A round of the Warden/Deviant coevolution began.
     RoundOpened { round: u64 },
 
+    /// Every attack the Deviant attempted, in full, whatever the verdict.
+    ///
+    /// Distinct from [`Event::ExploitLanded`], which records only the
+    /// containment-relevant fact that a *new class* fell. This records the
+    /// whole attempt — the attack as data, the verdict, the reward — for
+    /// every round, because that is the training record. The negatives matter
+    /// most: a dataset of only landed attacks teaches an adversary what
+    /// worked and nothing about what to stop trying, and most of a healthy
+    /// run is the Warden holding. Keeping the repelled and inert attempts is
+    /// the same instinct as the rest of the ledger — a thing not attempted is
+    /// a signal, and a thing attempted and turned away is a stronger one.
+    AttackAttempted {
+        round: u64,
+        class: ExploitClass,
+        /// The attack, serialised. Enough to replay it or train on it.
+        attack: serde_json::Value,
+        /// `landed` / `repelled` / `inert`.
+        verdict: String,
+        /// Distance from the archived repertoire, `[0, 1]`.
+        novelty: f64,
+        /// What the attempt was worth: positive for a novel landing, zero for
+        /// a repel, negative for inert noise.
+        reward: f64,
+    },
+
     /// The Deviant landed an attack the Warden did not withstand.
     ExploitLanded {
         round: u64,

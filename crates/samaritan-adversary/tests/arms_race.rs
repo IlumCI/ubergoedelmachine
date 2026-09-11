@@ -553,3 +553,95 @@ fn every_draft_class_round_trips_through_serde() {
         let _ = draft.into_attack();
     }
 }
+
+// =================================================== the training exporter
+
+use samaritan_adversary::dataset::{export, summarise, ExportConfig, to_jsonl};
+
+/// Run a few rounds and feed the arena a mix of verdicts via record().
+fn bout_with(verdicts: &[Verdict]) -> Ledger {
+    let mut l = ledger();
+    let mut arena = Arena::new(ArenaConfig::default());
+    let a = Attack::SandboxEscape { path: "../x".into(), note: "probe".into() };
+    for v in verdicts {
+        arena.record(&a, v.clone(), &mut l).unwrap();
+    }
+    l
+}
+
+#[test]
+fn every_attempt_becomes_a_training_row_whatever_the_verdict() {
+    // The reason the ledger now records attempts in full: the negatives are
+    // most of the data, and a set of only landed attacks teaches an adversary
+    // nothing about what to stop trying.
+    let l = bout_with(&[
+        Verdict::Repelled { by: "held".into() },
+        Verdict::Inert { why: "malformed".into() },
+        Verdict::Repelled { by: "held".into() },
+    ]);
+    let rows = export(&l, &ExportConfig::default()).unwrap();
+    assert_eq!(rows.len(), 3, "every attempt should export, not just landings");
+    assert!(rows.iter().all(|r| r.system.contains("adversary")));
+    assert!(rows.iter().all(|r| !r.completion.is_empty()));
+}
+
+#[test]
+fn landed_only_keeps_the_positives() {
+    // Two of these land (novel), the rest are repelled. A positives-only SFT
+    // set keeps exactly the landings.
+    let l = bout_with(&[
+        Verdict::Landed { evidence: "in".into() },
+        Verdict::Repelled { by: "held".into() },
+        Verdict::Inert { why: "x".into() },
+    ]);
+    let all = export(&l, &ExportConfig::default()).unwrap();
+    let pos = export(&l, &ExportConfig::landed_only()).unwrap();
+    assert_eq!(all.len(), 3);
+    assert_eq!(pos.len(), 1, "only the landing survives the reward floor");
+    assert_eq!(pos[0].verdict, "landed");
+    assert!(pos[0].reward > 0.0);
+}
+
+#[test]
+fn the_summary_flags_an_all_negative_dataset() {
+    // The honest check: a run where the Warden held everything has no positive
+    // signal, and a reward-weighted objective on it converges on "attempt
+    // nothing". The summary must say so before a GPU is spent.
+    let held = bout_with(&[
+        Verdict::Repelled { by: "held".into() },
+        Verdict::Repelled { by: "held".into() },
+        Verdict::Inert { why: "x".into() },
+    ]);
+    let s = summarise(&held).unwrap();
+    assert_eq!(s.total, 3);
+    assert_eq!(s.landed, 0);
+    assert!(!s.has_positive_signal(), "an all-repel run has nothing to train on");
+    assert!(s.mean_reward <= 0.0, "held + inert averages non-positive");
+
+    let breached = bout_with(&[Verdict::Landed { evidence: "in".into() }]);
+    assert!(summarise(&breached).unwrap().has_positive_signal());
+}
+
+#[test]
+fn jsonl_is_one_object_per_line() {
+    let l = bout_with(&[Verdict::Repelled { by: "x".into() }, Verdict::Landed { evidence: "y".into() }]);
+    let rows = export(&l, &ExportConfig::default()).unwrap();
+    let jsonl = to_jsonl(&rows);
+    let lines: Vec<&str> = jsonl.lines().collect();
+    assert_eq!(lines.len(), 2);
+    for line in lines {
+        // Each line must parse independently -- that is what "JSONL" means.
+        let _: serde_json::Value = serde_json::from_str(line).unwrap();
+    }
+}
+
+#[test]
+fn the_exported_completion_is_the_attack_the_model_should_learn() {
+    // The completion must be the attack JSON, so a trainer teaches the model
+    // to emit exactly what the grammar constrains it to.
+    let l = bout_with(&[Verdict::Landed { evidence: "in".into() }]);
+    let rows = export(&l, &ExportConfig::default()).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&rows[0].completion).unwrap();
+    assert_eq!(v["attack"], "sandbox_escape", "the completion is the tagged attack");
+    assert_eq!(v["path"], "../x");
+}

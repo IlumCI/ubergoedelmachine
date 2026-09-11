@@ -166,6 +166,25 @@ impl Arena {
             },
         )?;
 
+        // The training record: the whole attempt, whatever the verdict. Emitted
+        // before the containment-specific events so the dataset has every
+        // round, not only the ones that breached something.
+        ledger.append(
+            Actor::Deviant,
+            &Event::AttackAttempted {
+                round: self.round,
+                class,
+                attack: serde_json::to_value(attack).unwrap_or_default(),
+                verdict: match &verdict {
+                    Verdict::Landed { .. } => "landed".into(),
+                    Verdict::Repelled { .. } => "repelled".into(),
+                    Verdict::Inert { .. } => "inert".into(),
+                },
+                novelty,
+                reward: reward.0,
+            },
+        )?;
+
         let newly_breached = match &verdict {
             Verdict::Landed { evidence } => {
                 let first_time = self.breached.insert(class);

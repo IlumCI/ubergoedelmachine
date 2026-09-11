@@ -511,6 +511,12 @@ impl Ledger {
         })
     }
 
+    /// Every attack the Deviant attempted, in order, for building a training
+    /// set from a run's bouts.
+    pub fn attack_attempts(&self) -> Result<Vec<Entry>, LedgerError> {
+        self.by_kind("attack_attempted")
+    }
+
     /// Exploit classes the Deviant has ever landed.
     pub fn landed_exploits(&self) -> Result<Vec<ExploitClass>, LedgerError> {
         let mut v: Vec<ExploitClass> = self

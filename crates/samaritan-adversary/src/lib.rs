@@ -31,11 +31,13 @@
 
 pub mod arena;
 pub mod attack;
+pub mod dataset;
 pub mod deviant;
 pub mod repertoire;
 
 pub use arena::{Arena, ArenaConfig, Round};
 pub use attack::{Attack, Target, Verdict, attempt, landing_violation};
+pub use dataset::{export, summarise, ExportConfig, TrainingRecord};
 pub use deviant::{DraftAttack, GenerativeDeviant, DRAFT_ATTACK_GBNF};
 pub use repertoire::{SeededAttacker, opening_book};
 
