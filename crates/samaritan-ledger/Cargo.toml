@@ -1,0 +1,16 @@
+[package]
+name = "samaritan-ledger"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+samaritan-dsl = { version = "0.1.0", path = "../samaritan-dsl" }
+samaritan-kernel = { version = "0.1.0", path = "../samaritan-kernel" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.20"
+
+[dev-dependencies]
+tempfile = "3.27.0"

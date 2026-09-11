@@ -1,0 +1,17 @@
+[package]
+name = "samaritan-exec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+samaritan-corpus = { version = "0.1.0", path = "../samaritan-corpus" }
+samaritan-dsl = { version = "0.1.0", path = "../samaritan-dsl" }
+samaritan-kernel = { version = "0.1.0", path = "../samaritan-kernel" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.20"
+
+[dev-dependencies]
+tempfile = "3.27.0"

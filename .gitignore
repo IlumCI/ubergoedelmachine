@@ -1,0 +1,7 @@
+/target
+*.db
+*.db-journal
+.env
+
+# Cloned upstream projects read for reference; never built or shipped.
+.research/

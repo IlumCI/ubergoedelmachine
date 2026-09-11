@@ -1,0 +1,38 @@
+# Samaritan runtime configuration.
+#
+# Both agents — the Warden and the Deviant — talk to a local, OpenAI-compatible
+# chat-completions endpoint. Point base_url at whatever you are running:
+# LM Studio, llama.cpp --server, vLLM, or Ollama's /v1 compat shim. No key is
+# sent unless you set one (some servers want a dummy).
+
+[agent]
+# The client speaks POST {base_url}/chat/completions.
+base_url = "http://localhost:1234/v1"
+api_key = ""                     # usually blank for local servers
+request_timeout_secs = 120
+# Every response must parse as a DecisionRecord. When the server supports it,
+# the client asks for JSON via response_format; otherwise it falls back to
+# extract-and-validate, and a reply that will not parse is a failed episode.
+force_json = true
+
+# Model choice is a cost lever. Level-0 playouts run in the thousands and want
+# something small and fast; mutation proposal happens rarely and wants your
+# strongest local model. Same endpoint, different model id — set to whatever
+# names your server exposes.
+[agent.models]
+playout   = "qwen2.5-coder-7b"   # level-0: the Warden solving repo tasks
+proposer  = "qwen2.5-coder-32b"  # level-1+: proposing self-modifications
+deviant   = "qwen2.5-coder-32b"  # the adversary; give it real teeth
+
+[sampling]
+playout_temperature  = 0.7
+proposer_temperature = 0.9       # more exploration when proposing mutations
+deviant_temperature  = 1.0       # the Deviant is meant to be creative
+
+[arena]
+# The sealed worktree the whole fight lives in. Never the real project.
+scratch_root = "C:/tmp/samaritan-arena"
+# Rounds a Warden must withstand the Deviant before the Deviant's capability
+# is bumped, and rounds of Deviant dominance before a Warden regression alert.
+warden_hold_threshold  = 5
+deviant_runaway_threshold = 3
