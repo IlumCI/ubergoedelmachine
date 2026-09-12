@@ -34,6 +34,7 @@
 
 pub mod patch;
 pub mod playfield;
+pub mod propose;
 
 use samaritan_cert::{Certificate, Pair, Provenance, Spending};
 use samaritan_corpus::Split;

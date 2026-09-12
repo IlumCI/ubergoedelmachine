@@ -49,7 +49,8 @@ use samaritan_dsl::{Mutation, MutationCode, MutationPolicy};
 use serde::{Deserialize, Serialize};
 
 pub use codepatch::{
-    AcceptedPatch, PatchRefusal, PatchReport, PatchVerifier, gate_code_patch,
+    AcceptedPatch, PatchContext, PatchProposer, PatchRefusal, PatchReport, PatchVerifier,
+    gate_code_patch,
 };
 pub use state::{Grammar, GrammarOp, Lesson, PolicyState};
 

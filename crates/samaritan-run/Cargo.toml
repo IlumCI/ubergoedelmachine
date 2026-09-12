@@ -7,6 +7,7 @@ repository.workspace = true
 
 [dependencies]
 samaritan-adversary = { version = "0.1.0", path = "../samaritan-adversary" }
+samaritan-agent = { version = "0.1.0", path = "../samaritan-agent" }
 samaritan-cert = { version = "0.1.0", path = "../samaritan-cert" }
 samaritan-corpus = { version = "0.1.0", path = "../samaritan-corpus" }
 samaritan-dsl = { version = "0.1.0", path = "../samaritan-dsl" }

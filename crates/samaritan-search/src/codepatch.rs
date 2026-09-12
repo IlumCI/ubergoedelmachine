@@ -31,8 +31,49 @@
 //! compiling anything, the same seam the domain uses for its evaluator.
 
 use samaritan_dsl::Mutation;
-use samaritan_kernel::{Admission, Approval, Refusal};
+use samaritan_kernel::{Admission, Approval, Refusal, FROZEN_PATHS};
 use serde::{Deserialize, Serialize};
+
+/// What a proposer is asked to improve, and what it is shown to do it.
+///
+/// Deliberately narrow. A proposer sees one file's source and a goal, and is
+/// asked for a diff to that file. It is not handed the whole tree: a patch that
+/// spans crates is harder to review, harder to verify in isolation, and far
+/// likelier to be the kind of sweeping change that should be a human's design
+/// decision rather than the machine's.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PatchContext {
+    /// What the patch should achieve, in a sentence.
+    pub goal: String,
+    /// Repo-relative path of the file to patch. Must not be frozen — see
+    /// [`PatchContext::targets_frozen`].
+    pub target_path: String,
+    /// The file's current contents, so a proposer can write a diff that applies.
+    pub current_source: String,
+}
+
+impl PatchContext {
+    /// Whether the target sits in the frozen core. A proposer should never be
+    /// *pointed* at one — the gate would refuse the patch anyway, but asking a
+    /// model to rewrite the kernel is a request that should not be made in the
+    /// first place, not merely one that fails late.
+    pub fn targets_frozen(&self) -> bool {
+        let p = self.target_path.replace('\\', "/");
+        FROZEN_PATHS.iter().any(|f| p.starts_with(*f))
+    }
+}
+
+/// Proposes a patch to the search's own source. The level-3 counterpart of the
+/// Deviant's [`crate`]-external `Attacker`: a trait, so the loop can be driven
+/// by a scripted proposer in a test as well as by a live model, and so the part
+/// that must be right (the gate) is never entangled with the part that is
+/// expensive and non-deterministic (generation).
+pub trait PatchProposer {
+    /// Propose a patch, or `None` if it has nothing to offer this round. The
+    /// returned mutation is always a [`Mutation::CodePatch`]; anything else is a
+    /// bug in the proposer, and the gate will reject it as not-a-code-patch.
+    fn propose(&mut self, ctx: &PatchContext) -> Option<Mutation>;
+}
 
 /// What the verifier found when it tried the patch in a scratch tree.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -262,6 +303,61 @@ mod tests {
         let mut v = Spy::new(PatchReport::passed("ok"));
         let got = gate_code_patch(&patch("not a diff at all"), &level3(), &mut v, Approval::Allow);
         assert!(matches!(got, Err(PatchRefusal::Screened(_))), "{got:?}");
+        assert_eq!(v.calls, 0);
+    }
+
+    /// A proposer that always returns the same prepared patch.
+    struct FixedProposer(Mutation);
+    impl PatchProposer for FixedProposer {
+        fn propose(&mut self, _ctx: &PatchContext) -> Option<Mutation> {
+            Some(self.0.clone())
+        }
+    }
+
+    fn context(target: &str) -> PatchContext {
+        PatchContext {
+            goal: "make the search a little faster".into(),
+            target_path: target.into(),
+            current_source: "fn main() {}\n".into(),
+        }
+    }
+
+    #[test]
+    fn a_context_pointed_at_the_search_is_not_frozen_but_the_kernel_is() {
+        assert!(!context("crates/samaritan-search/src/lib.rs").targets_frozen());
+        assert!(context("crates/samaritan-kernel/src/admission.rs").targets_frozen());
+        assert!(context("crates/samaritan-cert/src/martingale.rs").targets_frozen());
+        // Backslash spelling must not evade the check.
+        assert!(context("crates\\samaritan-kernel\\src\\x.rs").targets_frozen());
+    }
+
+    #[test]
+    fn a_proposer_driving_the_gate_still_needs_a_human() {
+        // End to end at the trait level: a proposer proposes, the gate decides,
+        // and even a clean patch waits on a person.
+        let mut proposer = FixedProposer(own_source());
+        let mut v = Spy::new(PatchReport::passed("ok"));
+        let ctx = context("crates/samaritan-search/src/lib.rs");
+        let proposed = proposer.propose(&ctx).expect("a proposal");
+        assert!(gate_code_patch(&proposed, &level3(), &mut v, Approval::Refuse).is_err());
+        assert!(gate_code_patch(&proposed, &level3(), &mut v, Approval::Allow).is_ok());
+    }
+
+    #[test]
+    fn a_proposer_aimed_at_the_frozen_core_is_screened_before_building() {
+        // Even if a proposer hands back a kernel patch, the gate turns it away
+        // without compiling it.
+        let kernel = patch(
+            "--- a/crates/samaritan-kernel/src/tier.rs\n\
+             +++ b/crates/samaritan-kernel/src/tier.rs\n",
+        );
+        let mut proposer = FixedProposer(kernel);
+        let mut v = Spy::new(PatchReport::passed("ok"));
+        let proposed = proposer.propose(&context("crates/samaritan-search/src/lib.rs")).unwrap();
+        assert!(matches!(
+            gate_code_patch(&proposed, &level3(), &mut v, Approval::Allow),
+            Err(PatchRefusal::Screened(_))
+        ));
         assert_eq!(v.calls, 0);
     }
 }
