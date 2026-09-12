@@ -42,7 +42,7 @@ RustLMHub — is in [docs/inference.md](docs/inference.md).
 | `samaritan-cli` | inline approval prompt; no standing-permission option — done |
 | `samaritan-episode` | level-0 rollout: sandbox, decide/route/execute loop, oracle, score — done |
 | `samaritan-cert` | test martingale, α-investing, provenance check — done |
-| `samaritan-search` | NRPA over self-reference depth, policy state, applier — done |
+| `samaritan-search` | NRPA over self-reference depth, policy state, applier; level-2 editable grammar and the level-3 code-patch gate — done |
 | `samaritan-reflect` | lessons mined from ledger outcomes (not self-report), fed to the search — done |
 | `samaritan-run` | the runner: one full self-improvement run as one experimental arm — done |
 

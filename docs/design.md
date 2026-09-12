@@ -1,6 +1,9 @@
 # Samaritan: a nested-certificate Gödel machine
 
-> Status: M0-M3 complete and running against a local model; 364 tests green.
+> Status: M0-M5 complete and running against a local model. Levels 2 and 3 are
+> no longer designed-for: the grammar is data the search can edit, and a
+> code patch to the search's own source runs through a screen-build-test-human
+> gate with a real worktree verifier.
 > Beyond the core, the harness now has a live adversary, an offline knowledge
 > base, an out-of-arena capability probe (HLE), and an earned-capability
 > milestone ladder. This document is the design of record; where it disagrees
