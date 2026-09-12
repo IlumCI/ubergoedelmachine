@@ -66,9 +66,10 @@ OLLAMA_KEEP_ALIVE=-1 nohup ollama serve > ollama.log 2>&1 &
 ollama pull qwen3.8:27b-mtp-q8_0
 printf 'FROM qwen3.8:27b-mtp-q8_0\nPARAMETER num_ctx 16384\n' > Modelfile
 ollama create samaritan-playout -f Modelfile
-# publish port 11434:
+# publish port 11434. --http-host-header is required: Ollama returns 403 for any
+# Host but localhost (DNS-rebinding guard), so rewrite it before the origin.
 wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O cloudflared && chmod +x cloudflared
-./cloudflared tunnel --url http://localhost:11434   # prints a https://<random>.trycloudflare.com URL
+./cloudflared tunnel --url http://localhost:11434 --http-host-header localhost:11434   # prints a https://<random>.trycloudflare.com URL
 ```
 
 Model choice, honestly: **Qwen3.8-27B (Q8_0 GGUF)** is the sweet spot on a 40 GB
