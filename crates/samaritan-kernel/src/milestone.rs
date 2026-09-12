@@ -241,11 +241,13 @@ impl fmt::Display for ActivationRefusal {
 
 /// Whether a capability may activate, in the given mode, right now.
 ///
-/// The whole gate in one place: eligibility, then — for the real resource — the
-/// human unlock and the simulation-first rule. `human_unlocked` must come from
-/// the frozen approval path; `simulated_demonstrated` records that the mock form
-/// was exercised. Both are facts the caller establishes from the ledger, never
-/// values the agent can assert about itself.
+/// Simulation is always permitted — a mock touches nothing real and is how the
+/// demonstrated-safely record is earned before eligibility exists. The real
+/// resource is the gated one: eligibility, then the human unlock, then the
+/// simulation-first rule. `human_unlocked` must come from the frozen approval
+/// path; `simulated_demonstrated` records that the mock form was exercised. Both
+/// are facts the caller establishes from the ledger, never values the agent can
+/// assert about itself.
 pub fn may_activate(
     capability: Capability,
     mode: Mode,
@@ -253,16 +255,19 @@ pub fn may_activate(
     human_unlocked: bool,
     simulated_demonstrated: bool,
 ) -> Result<(), ActivationRefusal> {
-    let elig = eligibility(capability, ev);
-    if !elig.is_eligible() {
-        return Err(ActivationRefusal::NotEligible { unmet: elig.unmet });
-    }
-    let r = capability.requirements();
     match mode {
-        // A mock touches nothing real: eligibility is enough, and this is how
-        // the simulation-first demonstration is earned in the first place.
+        // A mock touches nothing real, so it is always safe to run — and this is
+        // deliberately *not* gated on eligibility: simulation is how safe use is
+        // shown *before* the trust bar is met, so gating it would invert the
+        // intended order (practise in the mock, earn trust, then unlock the real
+        // resource). The simulation itself carries no risk to gate.
         Mode::Simulated => Ok(()),
         Mode::Real => {
+            let elig = eligibility(capability, ev);
+            if !elig.is_eligible() {
+                return Err(ActivationRefusal::NotEligible { unmet: elig.unmet });
+            }
+            let r = capability.requirements();
             if r.requires_human_unlock && !human_unlocked {
                 return Err(ActivationRefusal::NoHumanUnlock);
             }
@@ -331,10 +336,19 @@ mod tests {
     }
 
     #[test]
-    fn simulation_needs_eligibility_but_no_human() {
-        let ev = Evidence { hle_score: 0.0, clean_generations: 12, brier: 0.1, certified_selfmods: 0 };
-        // The mock form is how safe use is shown first: eligible, no human yet.
-        assert!(may_activate(Capability::ReadOnlyInternet, Mode::Simulated, &ev, false, false).is_ok());
+    fn simulation_is_free_because_it_touches_nothing_real() {
+        // A mock needs neither eligibility nor a human — it is how safe use is
+        // shown *before* the trust bar is met, so it must run on a fresh system.
+        let fresh = Evidence::none();
+        assert!(
+            may_activate(Capability::ReadOnlyInternet, Mode::Simulated, &fresh, false, false).is_ok()
+        );
+        // The real resource on that same fresh system is refused for lack of the
+        // trust record — the order the design intends.
+        assert!(matches!(
+            may_activate(Capability::ReadOnlyInternet, Mode::Real, &fresh, false, false),
+            Err(ActivationRefusal::NotEligible { .. })
+        ));
     }
 
     #[test]
