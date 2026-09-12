@@ -1039,12 +1039,14 @@ dependencies = [
  "samaritan-corpus",
  "samaritan-dsl",
  "samaritan-episode",
+ "samaritan-exec",
  "samaritan-kernel",
  "samaritan-ledger",
  "samaritan-reflect",
  "samaritan-search",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
 ]
 

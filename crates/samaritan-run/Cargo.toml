@@ -11,6 +11,7 @@ samaritan-cert = { version = "0.1.0", path = "../samaritan-cert" }
 samaritan-corpus = { version = "0.1.0", path = "../samaritan-corpus" }
 samaritan-dsl = { version = "0.1.0", path = "../samaritan-dsl" }
 samaritan-episode = { version = "0.1.0", path = "../samaritan-episode" }
+samaritan-exec = { version = "0.1.0", path = "../samaritan-exec" }
 samaritan-kernel = { version = "0.1.0", path = "../samaritan-kernel" }
 samaritan-ledger = { version = "0.1.0", path = "../samaritan-ledger" }
 samaritan-reflect = { version = "0.1.0", path = "../samaritan-reflect" }
@@ -18,3 +19,6 @@ samaritan-search = { version = "0.1.0", path = "../samaritan-search" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 thiserror = "2.0.20"
+
+[dev-dependencies]
+tempfile = "3.27.0"

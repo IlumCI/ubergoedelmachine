@@ -32,6 +32,7 @@
 //! Both are written every round, and [`samaritan_ledger::diagnose`] reads the
 //! pair.
 
+pub mod patch;
 pub mod playfield;
 
 use samaritan_cert::{Certificate, Pair, Provenance, Spending};
