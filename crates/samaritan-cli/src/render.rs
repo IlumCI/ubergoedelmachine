@@ -18,7 +18,7 @@
 //! the rest of that machinery decorative.
 
 use samaritan_dsl::{ActionKind, BlastRadius, ProposedAction, Reversibility};
-use samaritan_kernel::{ApprovalRequest, Tier};
+use samaritan_kernel::{ApprovalRequest, Capability, Evidence, Tier, eligibility};
 
 /// ANSI styling, switchable off for tests and dumb terminals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,6 +51,9 @@ impl Style {
     }
     fn cyan(self, s: &str) -> String {
         self.wrap("36", s)
+    }
+    fn green(self, s: &str) -> String {
+        self.wrap("32", s)
     }
 }
 
@@ -328,4 +331,103 @@ pub fn approval(req: &ApprovalRequest, width: usize, st: Style, selected: usize)
     ));
 
     out
+}
+
+/// Render the capability-milestone status from measured evidence.
+///
+/// Pure, like [`approval`], and for the same reason: this is the panel a human
+/// reads before deciding whether to move a ceiling, so being wrong about it is
+/// a safety problem, not an aesthetic one. It shows, per capability, whether the
+/// bar is met and — when it is not — exactly what is missing, and it never
+/// offers to grant anything: eligibility is reported, the unlock is the human's.
+pub fn milestones(ev: &Evidence, width: usize, st: Style) -> String {
+    let width = width.clamp(48, 100);
+    let inner = width - 4;
+    let mut out = String::new();
+
+    out.push_str(&st.dim(&format!("╭{}╮\n", "─".repeat(width - 2))));
+    let mut boxline = |s: &str| {
+        let pad = inner.saturating_sub(visible_len(s));
+        out.push_str(&format!(
+            "{} {}{} {}\n",
+            st.dim("│"),
+            s,
+            " ".repeat(pad),
+            st.dim("│")
+        ));
+    };
+
+    boxline(&st.bold("capability milestones"));
+    boxline("");
+    boxline(&st.dim(&format!(
+        "HLE {:.1}%  ·  clean {}  ·  Brier {:.3}  ·  certified {}",
+        ev.hle_score * 100.0,
+        ev.clean_generations,
+        ev.brier,
+        ev.certified_selfmods,
+    )));
+    boxline("");
+
+    for cap in Capability::ALL {
+        let e = eligibility(cap, ev);
+        let needs_human = cap.requirements().requires_human_unlock;
+        let (glyph, status) = if e.is_eligible() && !needs_human {
+            (st.green("●"), st.green("active"))
+        } else if e.is_eligible() {
+            (st.green("✓"), st.green("eligible — awaiting human unlock"))
+        } else {
+            (st.red("✗"), st.red("locked"))
+        };
+        boxline(&format!("{glyph} {}  {status}", st.bold(&cap.to_string())));
+        for reason in &e.unmet {
+            for w in hard_wrap(reason, inner.saturating_sub(4)) {
+                boxline(&format!("    {}", st.dim(&w)));
+            }
+        }
+    }
+
+    out.push_str(&st.dim(&format!("╰{}╯\n", "─".repeat(width - 2))));
+    out.push('\n');
+    out.push_str(&format!(
+        "  {}\n",
+        st.dim("eligible is not granted — a human moves the ceiling, and real")
+    ));
+    out.push_str(&format!(
+        "  {}\n",
+        st.dim("reach requires a simulated demonstration first")
+    ));
+    out
+}
+
+#[cfg(test)]
+mod milestone_tests {
+    use super::*;
+    use samaritan_kernel::Evidence;
+
+    #[test]
+    fn a_fresh_system_shows_the_floor_active_and_the_rest_locked() {
+        let out = milestones(&Evidence::none(), 72, Style::PLAIN);
+        assert!(out.contains("capability milestones"));
+        // The floor is active with no human needed.
+        assert!(out.contains("local sandbox  active"));
+        // The outward tiers are locked, and the panel says why.
+        assert!(out.contains("read-only internet  locked"));
+        assert!(out.contains("clean generations"));
+        assert!(out.contains("Brier"));
+    }
+
+    #[test]
+    fn a_ready_record_reads_eligible_but_never_granted() {
+        let ev = Evidence {
+            hle_score: 0.12,
+            clean_generations: 30,
+            brier: 0.05,
+            certified_selfmods: 4,
+        };
+        let out = milestones(&ev, 72, Style::PLAIN);
+        assert!(out.contains("public repo  eligible — awaiting human unlock"));
+        // The panel must never imply a self-grant.
+        assert!(out.contains("a human moves the ceiling"));
+        assert!(!out.to_lowercase().contains("granted automatically"));
+    }
 }
