@@ -70,6 +70,10 @@ fn main() {
 
     let agent = Agent::new(AgentConfig {
         base_url: base_url.clone(),
+        // Set when the solver is a remote endpoint behind a key (e.g. vLLM on an
+        // A100 exposed through a cloudflared tunnel — see docs/colab-remote.md).
+        // Empty for the local server, which wants nothing.
+        api_key: std::env::var("SAMARITAN_API_KEY").unwrap_or_default(),
         model: "samaritan-playout".into(),
         // A little exploration helps a thinking model; not greedy, not wild.
         temperature: 0.6,

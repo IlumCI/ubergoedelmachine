@@ -59,6 +59,8 @@ fn main() {
 
     let agent = Agent::new(AgentConfig {
         base_url: base_url.clone(),
+        // For a remote keyed solver (A100 via a tunnel); empty for the local one.
+        api_key: std::env::var("SAMARITAN_API_KEY").unwrap_or_default(),
         model: "samaritan-playout".into(),
         temperature: 0.7, // some diversity: different attempts solve different items
         max_tokens,
