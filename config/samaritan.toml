@@ -45,6 +45,10 @@ playout_temperature  = 0.7
 proposer_temperature = 0.9       # more exploration when proposing mutations
 deviant_temperature  = 1.0       # the Deviant is meant to be creative
 max_tokens = 1024
+# The abliterated checkpoint loops — a clause or a `..\` segment repeated until
+# it overruns the budget and the JSON will not parse. A mild penalty stops that;
+# the bout examples set 1.2 and cap attack tokens lower (640). See samaritan-agent.
+repeat_penalty = 1.2
 
 [model]
 repo  = "mradermacher/Huihui-Ministral-3-8B-Reasoning-2512-abliterated-GGUF"
@@ -59,7 +63,7 @@ size_gb = 6.49
 gpu_layers = 18            # measured; 18-19 equivalent, cliff at 20
 threads = 6                      # P-cores only; E-cores slow the batch down
 threads_batch = 10               # prompt processing is compute-bound, use all
-parallel = 4                     # batching amortises the weight read
+parallel = 2                     # dialled down after a thermal scare; raise once cooling is proven
 ctx_per_slot = 4096
 
 [arena]

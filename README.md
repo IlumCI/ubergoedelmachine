@@ -11,7 +11,7 @@ how it is positioned against the Gödel-machine literature.
 ## Status
 
 **The full harness is assembled and running against a local model.** Sixteen
-crates, 354 tests green. A run composes corpus -> episode -> reflect -> search -> certify ->
+crates, 364 tests green. A run composes corpus -> episode -> reflect -> search -> certify ->
 ledger into one of three experimental arms (Solo / Critic / Adversarial), gated
 by the anytime-valid certificate and bounded by a compute budget. The live
 Christ and Anti-Christ both drive a grammar-constrained local model; bouts feed
