@@ -53,8 +53,10 @@ colab ssh -s samaritan               # a shell on the runtime
 In the `colab ssh` shell (or a notebook cell) on the runtime:
 
 ```bash
-# Ollama bundles its own CUDA — no build against Colab's stack. Colab has no
-# systemd, so start the daemon by hand and keep the model resident.
+# Ollama bundles its own CUDA — no build against Colab's stack. Its installer
+# extracts a zstd tarball and Colab lacks zstd, so install that first. Colab has
+# no systemd, so start the daemon by hand and keep the model resident.
+apt-get -qq install -y zstd || (apt-get -qq update && apt-get -qq install -y zstd)
 curl -fsSL https://ollama.com/install.sh | sh
 OLLAMA_KEEP_ALIVE=-1 nohup ollama serve > ollama.log 2>&1 &
 # Qwen3.8-27B (Q8_0, ~30 GB) is the strong reasoning model that fits 40 GB. The
