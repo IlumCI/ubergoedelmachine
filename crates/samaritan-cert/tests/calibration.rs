@@ -142,6 +142,68 @@ fn a_fixed_bet_is_also_a_valid_supermartingale() {
     assert!(bad as f64 / 1500.0 <= 0.075, "{bad}/1500 with a fixed bet");
 }
 
+#[test]
+fn kelly_betting_keeps_the_guarantee() {
+    // The uncertainty-aware bet must be as valid as the others: predictable and
+    // in [0, cap], so still a supermartingale under the null.
+    let mut rng = Rng::new(0x4B_45_4C_4C);
+    let mut bad = 0;
+    for _ in 0..2000 {
+        let pairs = null_pairs(&mut rng, 400, 0.5);
+        let mut m = Martingale::new(Betting::Kelly { cap: 0.5, prior: 8.0 });
+        m.observe_all(&pairs);
+        if m.crossed(0.05) {
+            bad += 1;
+        }
+    }
+    let rate = bad as f64 / 2000.0;
+    assert!(rate <= 0.05 * 1.5, "kelly false-cert rate {rate:.4}");
+    eprintln!("kelly false certification rate: {rate:.4}");
+}
+
+#[test]
+fn kelly_bets_more_conservatively_early_than_full_kelly() {
+    // A short all-win prefix: full Kelly on the empirical p races the cap almost
+    // at once, while the shrunk edge grows in. So after a few pairs the Kelly
+    // wealth is below the adaptive wealth — the point of the refinement.
+    let wins = [
+        Pair::new(true, false),
+        Pair::new(true, false),
+        Pair::new(true, false),
+        Pair::new(true, false),
+    ];
+    let mut adaptive = Martingale::new(Betting::Adaptive { cap: 0.5 });
+    let mut kelly = Martingale::new(Betting::Kelly { cap: 0.5, prior: 8.0 });
+    adaptive.observe_all(&wins);
+    kelly.observe_all(&wins);
+    assert!(
+        kelly.wealth() < adaptive.wealth(),
+        "kelly {:.3} should trail adaptive {:.3} on a short strong-edge prefix",
+        kelly.wealth(),
+        adaptive.wealth()
+    );
+}
+
+#[test]
+fn kelly_still_detects_a_real_improvement_with_enough_evidence() {
+    // Conservative early does not mean blind: given enough pairs the shrinkage
+    // washes out and a genuine gain is certified.
+    let mut rng = Rng::new(24601);
+    let mut certified = 0;
+    for _ in 0..200 {
+        let pairs = improved_pairs(&mut rng, 500, 0.40, 0.60);
+        let mut m = Martingale::new(Betting::Kelly { cap: 0.5, prior: 8.0 });
+        m.observe_all(&pairs);
+        if m.crossed(0.05) {
+            certified += 1;
+        }
+    }
+    assert!(
+        certified as f64 / 200.0 > 0.9,
+        "only {certified}/200 real improvements detected under Kelly"
+    );
+}
+
 // ============================================================ it finds real gains
 
 #[test]

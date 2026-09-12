@@ -89,7 +89,29 @@ pub enum Betting {
     ///
     /// Capped below 1: a stake of 1 would bankrupt the process on a single
     /// adverse pair, and a wealth of exactly zero can never recover.
+    ///
+    /// Worth naming what this already is: for this even-odds game the
+    /// growth-optimal (Kelly) fraction *is* `2p − 1`, so `Adaptive` is full
+    /// Kelly on the empirical edge. [`Betting::Kelly`] is the uncertainty-aware
+    /// refinement.
     Adaptive { cap: f64 },
+    /// Uncertainty-aware Kelly (economics / information theory, Kelly 1956).
+    ///
+    /// Same target edge as [`Betting::Adaptive`] — `2p − 1` is the Kelly
+    /// fraction here — but `p` is a **Beta-posterior mean shrunk toward the
+    /// null's ½**, not the raw frequency. `prior` is the pseudo-count strength
+    /// `s`, split evenly around ½, so the edge is `2·(wins + s/2)/(seen + s) −
+    /// 1`: a large edge seen over few pairs bets small and grows into full Kelly
+    /// as evidence accrues.
+    ///
+    /// The reason this is not a nicety: full Kelly on a noisy point estimate
+    /// over-bets, and an over-bet drifts the wealth *down* on the first adverse
+    /// pair — spending, under Ville, evidence the run could have kept. Shrinking
+    /// the early edge is the standard fix (fractional Kelly), and here it falls
+    /// out of a prior rather than an arbitrary fraction. Still predictable and
+    /// still in `[0, cap]`, so the supermartingale property — and the guarantee
+    /// — is untouched.
+    Kelly { cap: f64, prior: f64 },
 }
 
 impl Betting {
@@ -105,6 +127,17 @@ impl Betting {
                 // edge means bet nothing rather than bet against ourselves:
                 // this is a one-sided test of "better", not of "different".
                 (2.0 * p - 1.0).clamp(0.0, cap.clamp(0.0, 0.95))
+            }
+            Betting::Kelly { cap, prior } => {
+                let s = prior.max(0.0);
+                let denom = seen as f64 + s;
+                if denom == 0.0 {
+                    // No data and no prior mass: nothing to bet on yet.
+                    return 0.0;
+                }
+                // Posterior mean of p under Beta(s/2, s/2), shrunk toward ½.
+                let p_hat = (wins as f64 + s / 2.0) / denom;
+                (2.0 * p_hat - 1.0).clamp(0.0, cap.clamp(0.0, 0.95))
             }
         }
     }
