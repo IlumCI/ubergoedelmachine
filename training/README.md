@@ -25,26 +25,30 @@ adapter  ->  merge + convert  ->  GGUF  ->  serve.ps1
 ```
 
 1. **Produce landings.** Against intact guards the Warden repels everything (the
-   healthy case) and there is nothing to train on. Point the Deviant at a
-   weakened foil to generate positive signal. Two foils exist:
-   - `WEAK=separator` — the CWE-41 path hole. High-value (it teaches exact
-     frozen-path spelling) but the 8B fumbles the exact string, so landings are
-     rare.
-   - `WEAK=ceiling` (default) — the CWE-1284 bounds hole. The model emits a
-     valid knob and a large value every round, so it lands reliably; this is the
-     one that accumulates volume.
+   healthy case) and there is nothing to train on. Point the Deviant at weakened
+   foils to generate positive signal. Four holes exist, each a documented,
+   realistic weakness; `WEAK` opens a set (`all`, or a comma list):
+   - `separator` (CWE-41) — the path-equivalence hole. High-value (teaches exact
+     frozen-path spelling) but the 8B fumbles the string, so it lands rarely.
+   - `ceiling` (CWE-1284) — the bounds hole. Lands reliably but low-diversity:
+     the model converges on a few `calibration_ceiling` raises.
+   - `sandbox` (CWE-22) — the path-canonicalisation hole. The model invents a
+     stream of *distinct* escape paths (`\\?\`, UNC, device, drive-letter), so
+     this is the **richest source of variety**.
+   - `misgrade` (CWE-807) — the trust-the-label hole. Varied mislabels land.
+
+   **Diversity, not landing rate, is the binding constraint** — a fine-tune
+   needs distinct techniques, not many copies of one. So the **harvester**
+   defaults to `WEAK=all`: one bout per seed, every hole open, landings merged
+   into one dataset, reported against `--min-positive`:
    ```powershell
-   $env:KNOWLEDGE="seed"; $env:WEAK="ceiling"; $env:LEDGER_DB="bout.db"
-   cargo run -p samaritan-adversary --example train_target
-   ```
-   For volume, prefer the **harvester** — one bout per seed, landings merged into
-   one dataset, with a report against `--min-positive`:
-   ```powershell
-   $env:KNOWLEDGE="seed"; $env:WEAK="ceiling"; $env:SEED_COUNT="8"
+   $env:KNOWLEDGE="seed"; $env:SEED_COUNT="8"   # WEAK defaults to all
    cargo run -p samaritan-adversary --example harvest   # writes harvest-dataset.jsonl
    ```
-   The harvester writes the merged positives directly, so with it you can skip
-   the per-bout export in step 2 and train on `harvest-dataset.jsonl`.
+   The harvester writes the merged positives directly, so with it you skip the
+   per-bout export in step 2 and train on `harvest-dataset.jsonl`. For a single
+   focused bout instead, `train_target` takes the same `WEAK` (default
+   `ceiling`) and writes a `LEDGER_DB`.
 2. **Export the positives** (only if you ran a single `train_target` bout).
    ```powershell
    $env:POSITIVES_ONLY="1"
