@@ -61,7 +61,9 @@ fn main() {
         base_url: base_url.clone(),
         // For a remote keyed solver (A100 via a tunnel); empty for the local one.
         api_key: std::env::var("SAMARITAN_API_KEY").unwrap_or_default(),
-        model: "samaritan-playout".into(),
+        // Ollama tags models (name:latest) and matches exactly on its OpenAI
+        // endpoint — set SAMARITAN_MODEL=samaritan-playout:latest for that backend.
+        model: std::env::var("SAMARITAN_MODEL").unwrap_or_else(|_| "samaritan-playout".into()),
         temperature: 0.7, // some diversity: different attempts solve different items
         max_tokens,
         repeat_penalty: 1.1,

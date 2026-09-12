@@ -90,6 +90,7 @@ the runtime when done.
 ```powershell
 $env:SAMARITAN_URL = "https://<random>.trycloudflare.com/v1"   # the tunnel URL + /v1
 $env:SAMARITAN_API_KEY = "ollama"                              # any value; Ollama ignores it
+$env:SAMARITAN_MODEL = "samaritan-playout:latest"             # Ollama matches the tag exactly
 $env:MAX_TOKENS = "8192"                                       # Qwen3.8 thinks a lot
 $env:DATASET = "$env:USERPROFILE\models\reasoning\gsm-symbolic-p2.jsonl"
 cargo run -p samaritan-run --example reason_eval    # now answered by Qwen3.8-27B on the A100

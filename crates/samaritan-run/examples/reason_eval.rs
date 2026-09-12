@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use samaritan_agent::{Agent, AgentConfig, Constrain};
 use samaritan_corpus::{load_reasoning, Split};
-use samaritan_episode::{run_reasoning_episode, EpisodeConfig};
+use samaritan_episode::{run_reasoning_episode, EpisodeConfig, Ending};
 use samaritan_ledger::{FixedClock, Ledger};
 
 /// A trivial, verifiable smoke set across a few domains. Not an evaluation — a
@@ -74,7 +74,11 @@ fn main() {
         // A100 exposed through a cloudflared tunnel — see docs/colab-remote.md).
         // Empty for the local server, which wants nothing.
         api_key: std::env::var("SAMARITAN_API_KEY").unwrap_or_default(),
-        model: "samaritan-playout".into(),
+        // The served model name. Ollama tags its models (`name:latest`), and its
+        // OpenAI endpoint matches exactly — so against an Ollama backend set
+        // SAMARITAN_MODEL=samaritan-playout:latest. Defaults to the bare alias the
+        // local llama.cpp server uses.
+        model: std::env::var("SAMARITAN_MODEL").unwrap_or_else(|_| "samaritan-playout".into()),
         // A little exploration helps a thinking model; not greedy, not wild.
         temperature: 0.6,
         // Room for a real thinking trace within the time budget.
@@ -120,20 +124,30 @@ fn main() {
         if correct {
             e.0 += 1;
         }
+        let label = match &out.ending {
+            Ending::AgentFailed { .. } => "FAIL",
+            _ if correct => "OK  ",
+            _ => "MISS",
+        };
         println!(
             "  q{:>2} [{:<9}] {}  conf {:.2}  ({} tok)",
             i + 1,
             t.domain(),
-            if correct { "OK  " } else { "MISS" },
+            label,
             conf,
             out.tokens,
         );
-        // On a miss, show what the model actually answered — the fastest way to
-        // tell a real reasoning error from an extraction/grading edge.
-        if !correct {
+        // A model/server failure is not a wrong answer — surface the reason
+        // (HTTP status + body) instead of hiding it as a MISS. This is what an
+        // all-zero run needs: a 404 model-not-found or a 403 reads plainly here.
+        if let Ending::AgentFailed { detail } = &out.ending {
+            let d: String = detail.replace('\n', " ").chars().take(300).collect();
+            println!("        agent failed: {d}");
+        } else if !correct {
+            // A real miss: show what the model actually answered — the fastest
+            // way to tell a reasoning error from an extraction/grading edge.
             if let Some(a) = &out.answer {
-                let a = a.replace('\n', " ");
-                let a = if a.len() > 100 { format!("{}…", &a[..100]) } else { a };
+                let a: String = a.replace('\n', " ").chars().take(100).collect();
                 println!("        got: {a:?}");
             }
         }
