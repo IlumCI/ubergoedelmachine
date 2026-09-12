@@ -293,6 +293,107 @@ pub fn run_episode(
     })
 }
 
+/// What a reasoning solver returned for one question.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReasoningAnswer {
+    /// The answer to grade against the key. The solver's *final* answer, not its
+    /// working — the grader matches this string.
+    pub answer: String,
+    /// Stated confidence in `[0, 1]`, so a reasoning episode feeds calibration
+    /// exactly as a coding one does. A solver that will not state a confidence
+    /// should return 0.5, not lie.
+    pub confidence: f64,
+    pub tokens: u64,
+}
+
+/// Produces an answer to a reasoning question.
+///
+/// The reasoning counterpart of [`Decider`]: a seam so the reasoning episode is
+/// testable against a scripted solver, and so the W2 tool loop (retrieval, code
+/// execution) can be dropped in behind it without changing the episode. The
+/// solver never grades itself — grading is the harness's, via [`Task::grade`].
+pub trait ReasoningSolver {
+    fn solve(&self, question: &str, lessons: &[String]) -> Result<ReasoningAnswer, EpisodeError>;
+}
+
+/// Run one reasoning task to a score.
+///
+/// The parallel of [`run_episode`] for the reasoning surface: no worktree, no
+/// suite, no file edits. The solver answers, the harness grades against the
+/// key, and the outcome is the *same* [`EpisodeOutcome`] a coding task produces
+/// — same utility, same calibration pair — so every level of the search scores
+/// both surfaces through one code path.
+pub fn run_reasoning_episode(
+    task: &Task,
+    solver: &dyn ReasoningSolver,
+    ledger: &mut Ledger,
+    cfg: &EpisodeConfig,
+) -> Result<EpisodeOutcome, EpisodeError> {
+    let started = Instant::now();
+    if !task.is_reasoning() {
+        return Err(EpisodeError::Setup(format!(
+            "run_reasoning_episode called on a non-reasoning task {}",
+            task.id.0
+        )));
+    }
+
+    let answer = solver.solve(&task.prompt, &cfg.lessons);
+    let (ending, correct, confidence, tokens) = match answer {
+        Ok(a) => {
+            // Grading is the harness's job. `grade` returns Some for a reasoning
+            // task; the None arm is unreachable here because of the guard above,
+            // but a wrong answer is a clean failure, not an error.
+            let correct = task.grade(&a.answer).unwrap_or(false);
+            let ending = if correct {
+                Ending::Solved { at_step: 1 }
+            } else {
+                Ending::StepsExhausted
+            };
+            (ending, correct, a.confidence.clamp(0.0, 1.0), a.tokens)
+        }
+        Err(e) => (Ending::AgentFailed { detail: e.to_string() }, false, 0.5, 0),
+    };
+
+    // The prediction is the solver's stated confidence against the oracle's
+    // verdict — the same calibration signal a coding episode records.
+    let predictions = vec![(confidence, correct)];
+    ledger.append(
+        Actor::System,
+        &Event::OutcomeObserved {
+            decision: samaritan_dsl::DecisionId::new(),
+            resolved: correct,
+            oracle: serde_json::json!({ "correct": correct, "domain": task.domain() }),
+        },
+    )?;
+
+    let components = Components {
+        task_success: if correct { 1.0 } else { 0.0 },
+        brier: brier(&predictions).unwrap_or(0.0),
+        approvals_requested: 0,
+        seconds: started.elapsed().as_secs_f64(),
+    };
+    let utility = EpisodeUtility::clean(&components, &cfg.weights);
+
+    ledger.append(
+        Actor::System,
+        &Event::EpisodeScored {
+            decision: samaritan_dsl::DecisionId::new(),
+            utility: utility.clone(),
+        },
+    )?;
+
+    Ok(EpisodeOutcome {
+        task: task.id.clone(),
+        ending,
+        utility,
+        components,
+        steps: 1,
+        predictions,
+        tokens,
+        violations: Vec::new(),
+    })
+}
+
 struct OracleCheck {
     passed: bool,
     text: String,
@@ -344,4 +445,81 @@ pub fn brier(pairs: &[(f64, bool)]) -> Option<f64> {
         })
         .sum();
     Some(sum / pairs.len() as f64)
+}
+
+#[cfg(test)]
+mod reasoning_tests {
+    use super::*;
+    use samaritan_corpus::{AnswerKind, Split, Task, TaskId};
+    use samaritan_ledger::{FixedClock, Ledger};
+
+    /// A solver that returns a fixed answer at a fixed confidence.
+    struct Fixed(&'static str, f64);
+    impl ReasoningSolver for Fixed {
+        fn solve(&self, _q: &str, _l: &[String]) -> Result<ReasoningAnswer, EpisodeError> {
+            Ok(ReasoningAnswer { answer: self.0.into(), confidence: self.1, tokens: 20 })
+        }
+    }
+
+    struct Broken;
+    impl ReasoningSolver for Broken {
+        fn solve(&self, _q: &str, _l: &[String]) -> Result<ReasoningAnswer, EpisodeError> {
+            Err(EpisodeError::Setup("model down".into()))
+        }
+    }
+
+    fn task() -> Task {
+        Task::reasoning(
+            TaskId("r1".into()),
+            "numina",
+            "6 times 7?",
+            "42",
+            AnswerKind::ExactMatch,
+            "math",
+            "2026-09-01T00:00:00+00:00",
+            Split::Train,
+        )
+    }
+
+    fn ledger() -> Ledger {
+        Ledger::in_memory(Box::new(FixedClock("2026-09-12T00:00:00Z".into()))).unwrap()
+    }
+
+    #[test]
+    fn a_correct_answer_solves_and_scores_well() {
+        let mut l = ledger();
+        let out = run_reasoning_episode(&task(), &Fixed("the answer is 42", 0.9), &mut l, &EpisodeConfig::default()).unwrap();
+        assert!(out.ending.solved());
+        assert_eq!(out.components.task_success, 1.0);
+        // Confident and correct → low Brier contribution.
+        assert!(out.predictions == vec![(0.9, true)]);
+    }
+
+    #[test]
+    fn a_wrong_answer_is_a_clean_failure_not_an_error() {
+        let mut l = ledger();
+        let out = run_reasoning_episode(&task(), &Fixed("43", 0.9), &mut l, &EpisodeConfig::default()).unwrap();
+        assert!(!out.ending.solved());
+        assert_eq!(out.components.task_success, 0.0);
+        assert_eq!(out.predictions, vec![(0.9, false)]);
+    }
+
+    #[test]
+    fn a_solver_failure_is_recorded_as_agent_failed() {
+        let mut l = ledger();
+        let out = run_reasoning_episode(&task(), &Broken, &mut l, &EpisodeConfig::default()).unwrap();
+        assert!(matches!(out.ending, Ending::AgentFailed { .. }));
+        assert_eq!(out.components.task_success, 0.0);
+    }
+
+    #[test]
+    fn a_coding_task_is_refused_by_the_reasoning_path() {
+        // Dispatch discipline: the reasoning entry point must not silently score
+        // a coding task, whose success is a suite, not a string.
+        let mut l = ledger();
+        let mut coding = task();
+        coding.kind = samaritan_corpus::TaskKind::Coding;
+        let r = run_reasoning_episode(&coding, &Fixed("42", 0.9), &mut l, &EpisodeConfig::default());
+        assert!(r.is_err());
+    }
 }
