@@ -10,8 +10,8 @@ use std::process::Command;
 
 use samaritan_corpus::screen::{OracleOutcome, OracleRunner, Screening, screen_one};
 use samaritan_corpus::{
-    Bucket, Corpus, Manifest, MineOptions, OracleSpec, Split, Task, TestPatterns, materialize,
-    mine, screen_for_flakes,
+    AnswerKind, Bucket, Corpus, Manifest, MineOptions, OracleSpec, Split, Task, TaskId, TaskKind,
+    TestPatterns, grade_answer, materialize, mine, screen_for_flakes,
 };
 
 // ------------------------------------------------------------- test repo
@@ -664,4 +664,69 @@ fn frontier_tasks_never_reach_the_training_loop() {
         "a frontier task must not be trainable even in a trainable corpus"
     );
     assert_eq!(trainable.tasks_in(Split::Frontier).count(), 1);
+}
+
+// ------------------------------------------------------- the reasoning surface
+
+fn reasoning_task(answer: &str, kind: AnswerKind) -> Task {
+    Task::reasoning(
+        TaskId("r1".into()),
+        "numina",
+        "What is 6 times 7?",
+        answer,
+        kind,
+        "math",
+        "2026-09-01T00:00:00+00:00",
+        Split::Train,
+    )
+}
+
+#[test]
+fn a_reasoning_task_grades_its_answer_and_a_coding_task_does_not() {
+    let r = reasoning_task("42", AnswerKind::ExactMatch);
+    assert!(r.is_reasoning());
+    assert_eq!(r.domain(), "math");
+    assert_eq!(r.grade("The answer is 42."), Some(true));
+    assert_eq!(r.grade("43"), Some(false));
+
+    // A coding task has no answer key; grading one is a category error and
+    // returns None rather than a misleading verdict.
+    let (rr, _) = repo_with_one_task();
+    let coding = mine(rr.path(), &opts()).unwrap().tasks.remove(0);
+    assert!(!coding.is_reasoning());
+    assert_eq!(coding.grade("anything"), None);
+}
+
+#[test]
+fn grade_answer_is_conservative() {
+    // A single-token key is found as a standalone token; a multi-word key needs
+    // the whole phrase; a coincidental overlap does not count.
+    assert!(grade_answer("C", AnswerKind::MultipleChoice, "the correct option is C) foo"));
+    assert!(!grade_answer("C", AnswerKind::MultipleChoice, "I pick B"));
+    assert!(grade_answer("Marie Curie", AnswerKind::ExactMatch, "it was marie curie"));
+    assert!(!grade_answer("Marie Curie", AnswerKind::ExactMatch, "curie units are unrelated"));
+    assert!(!grade_answer("", AnswerKind::ExactMatch, "anything"));
+}
+
+#[test]
+fn a_task_without_a_kind_field_deserializes_as_coding() {
+    // Backward compatibility: every task mined or stored before the reasoning
+    // surface existed carried no `kind`, and must still read as a coding task.
+    let json = serde_json::json!({
+        "id": "legacy@abc",
+        "corpus": "ripgrep",
+        "commit": "abc",
+        "parent": "def",
+        "prompt": "fix the bug",
+        "test_paths": ["tests/x.rs"],
+        "deleted_test_paths": [],
+        "source_paths": ["src/x.rs"],
+        "oracle": { "program": "cargo", "args": ["test"], "timeout_secs": 300 },
+        "difficulty": { "source_files_changed": 1, "lines_added": 3, "lines_removed": 1, "test_files_changed": 1 },
+        "committed_at": "2026-01-01T00:00:00+00:00",
+        "split": "train"
+    });
+    let t: Task = serde_json::from_value(json).expect("legacy task deserializes");
+    assert!(matches!(t.kind, TaskKind::Coding));
+    assert!(!t.is_reasoning());
 }

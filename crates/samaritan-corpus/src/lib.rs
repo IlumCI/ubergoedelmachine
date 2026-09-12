@@ -94,6 +94,92 @@ impl OracleSpec {
     }
 }
 
+/// How a reasoning answer is checked against its key.
+///
+/// Mirrors the shape the eval grader uses; kept here because the grading rule
+/// belongs with the task that defines it, not with the harness that runs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AnswerKind {
+    /// A short free-form answer — a number, a name, a formula.
+    ExactMatch,
+    /// One option; the key is typically a letter.
+    MultipleChoice,
+}
+
+/// What kind of task this is, and the data specific to it.
+///
+/// [`TaskKind::Coding`] is the original: reproduce a commit's test outcome, with
+/// the payload in `Task`'s commit/parent/test-path fields and the oracle running
+/// a suite. [`TaskKind::Reasoning`] carries its own answer key and is graded by
+/// matching the agent's answer — the surface that transfers to HLE. The two are
+/// co-equal; a run may train on both.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "task_kind", rename_all = "snake_case")]
+pub enum TaskKind {
+    Coding,
+    Reasoning {
+        /// The answer key. Never shown to the agent.
+        answer: String,
+        answer_kind: AnswerKind,
+        /// Field, e.g. "math" / "chemistry" / "logic" — for domain routing.
+        domain: String,
+    },
+}
+
+impl Default for TaskKind {
+    fn default() -> Self {
+        TaskKind::Coding
+    }
+}
+
+/// Whether `given` answers `expected`, under the answer kind's matching rule.
+///
+/// A normalised match: lowercase, drop a leading "the answer is" preface, strip
+/// punctuation to spaces, collapse whitespace. A single-token key (a number, a
+/// choice letter) is accepted anywhere as a standalone token; a multi-word key
+/// must appear as a contiguous run. Deliberately conservative — it under-credits
+/// an unusual phrasing rather than over-crediting a coincidence. W8 upgrades the
+/// reasoning path to an LLM judge; this is the deterministic floor.
+pub fn grade_answer(expected: &str, _kind: AnswerKind, given: &str) -> bool {
+    let exp = normalize_answer(expected);
+    if exp.is_empty() {
+        return false;
+    }
+    let got = normalize_answer(given);
+    if got == exp {
+        return true;
+    }
+    let exp_tokens: Vec<&str> = exp.split(' ').filter(|t| !t.is_empty()).collect();
+    let got_tokens: Vec<&str> = got.split(' ').filter(|t| !t.is_empty()).collect();
+    if exp_tokens.len() == 1 {
+        got_tokens.contains(&exp_tokens[0])
+    } else {
+        got_tokens.windows(exp_tokens.len()).any(|w| w == exp_tokens.as_slice())
+    }
+}
+
+fn normalize_answer(s: &str) -> String {
+    let lower = s.trim().to_lowercase();
+    let lower = lower
+        .strip_prefix("the answer is")
+        .or_else(|| lower.strip_prefix("answer:"))
+        .or_else(|| lower.strip_prefix("answer is"))
+        .unwrap_or(&lower);
+    let mut out = String::with_capacity(lower.len());
+    let mut last_space = false;
+    for c in lower.chars() {
+        if c.is_alphanumeric() {
+            out.push(c);
+            last_space = false;
+        } else if !last_space {
+            out.push(' ');
+            last_space = true;
+        }
+    }
+    out.trim().to_string()
+}
+
 /// Rough size of the change the agent has to reproduce.
 ///
 /// Used to stratify sampling. Without it a level-0 batch drawn at random is
@@ -230,6 +316,83 @@ pub struct Task {
     /// Required for [`Split::Frontier`], meaningless otherwise.
     #[serde(default)]
     pub witness: Option<SolvabilityWitness>,
+    /// Coding (the commit/test payload above) or reasoning (an answer key).
+    /// Defaults to `Coding` so every task mined or serialized before the
+    /// reasoning surface existed still reads correctly.
+    #[serde(default)]
+    pub kind: TaskKind,
+}
+
+impl Task {
+    /// A reasoning task: a question graded against an answer key, with no
+    /// commit, no repo, and no suite. The coding-only fields are left empty and
+    /// are never read for this kind.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reasoning(
+        id: TaskId,
+        corpus: impl Into<String>,
+        prompt: impl Into<String>,
+        answer: impl Into<String>,
+        answer_kind: AnswerKind,
+        domain: impl Into<String>,
+        committed_at: impl Into<String>,
+        split: Split,
+    ) -> Self {
+        Task {
+            id,
+            corpus: corpus.into(),
+            commit: String::new(),
+            parent: String::new(),
+            prompt: prompt.into(),
+            test_paths: Vec::new(),
+            deleted_test_paths: Vec::new(),
+            source_paths: Vec::new(),
+            // A reasoning task's oracle is answer-grading, not a command; this
+            // spec is inert for it and the episode dispatches on `kind`.
+            oracle: OracleSpec { program: String::new(), args: Vec::new(), timeout_secs: 0 },
+            difficulty: Difficulty {
+                source_files_changed: 0,
+                lines_added: 0,
+                lines_removed: 0,
+                test_files_changed: 0,
+            },
+            committed_at: committed_at.into(),
+            split,
+            witness: None,
+            kind: TaskKind::Reasoning {
+                answer: answer.into(),
+                answer_kind,
+                domain: domain.into(),
+            },
+        }
+    }
+
+    /// Whether this is a reasoning task.
+    pub fn is_reasoning(&self) -> bool {
+        matches!(self.kind, TaskKind::Reasoning { .. })
+    }
+
+    /// Grade a candidate answer against a reasoning task's key.
+    ///
+    /// `None` for a coding task — it has no answer key, and a caller that grades
+    /// one has dispatched on the wrong thing. `Some(correct)` for a reasoning
+    /// task.
+    pub fn grade(&self, given: &str) -> Option<bool> {
+        match &self.kind {
+            TaskKind::Coding => None,
+            TaskKind::Reasoning { answer, answer_kind, .. } => {
+                Some(grade_answer(answer, *answer_kind, given))
+            }
+        }
+    }
+
+    /// The task's domain, for routing. Empty for coding tasks.
+    pub fn domain(&self) -> &str {
+        match &self.kind {
+            TaskKind::Coding => "",
+            TaskKind::Reasoning { domain, .. } => domain,
+        }
+    }
 }
 
 /// A named set of tasks from one repository.

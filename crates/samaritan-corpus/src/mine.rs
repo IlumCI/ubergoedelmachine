@@ -4,7 +4,7 @@ use std::path::Path;
 
 use crate::git::git;
 use crate::{
-    Corpus, CorpusError, Difficulty, OracleSpec, Split, Task, TaskId, TestPatterns,
+    Corpus, CorpusError, Difficulty, OracleSpec, Split, Task, TaskId, TaskKind, TestPatterns,
 };
 
 /// Field separator for `git log --format`. A control character, because commit
@@ -210,6 +210,9 @@ fn task_from_commit(
         split,
         // Frontier tasks are authored, not mined; nothing here produces one.
         witness: None,
+        // Git-mined tasks are coding tasks; reasoning tasks are imported, not
+        // mined from history.
+        kind: TaskKind::Coding,
     }))
 }
 
