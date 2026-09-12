@@ -41,6 +41,7 @@ fn outcome(solved: bool, confidence: f64, tokens: u64) -> EpisodeOutcome {
         tokens,
         violations: vec![],
         answer: None,
+        trace: None,
     }
 }
 

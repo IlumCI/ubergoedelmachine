@@ -136,6 +136,10 @@ pub struct EpisodeOutcome {
     /// export of reasoning traces. `None` for a coding episode, whose "answer"
     /// is a diff the sandbox already holds.
     pub answer: Option<String>,
+    /// The full reasoning trace behind a reasoning answer — what verified
+    /// self-training (STaR/ReST) learns from when the answer graded correct.
+    /// `None` for a coding episode.
+    pub trace: Option<String>,
 }
 
 /// Run one task to a score.
@@ -298,6 +302,7 @@ pub fn run_episode(
         tokens,
         violations,
         answer: None,
+        trace: None,
     })
 }
 
@@ -312,6 +317,10 @@ pub struct ReasoningAnswer {
     /// should return 0.5, not lie.
     pub confidence: f64,
     pub tokens: u64,
+    /// The full completion that produced this answer — the reasoning trace and
+    /// all. Kept because verified self-training (STaR/ReST) learns from the
+    /// *trace* of a correct solve, not just its final answer.
+    pub raw: String,
 }
 
 /// Produces an answer to a reasoning question.
@@ -371,17 +380,16 @@ pub fn cap_confidence(confidence: f64) -> f64 {
 impl ReasoningSolver for samaritan_agent::Agent {
     fn solve(&self, question: &str, lessons: &[String]) -> Result<ReasoningAnswer, EpisodeError> {
         let first = answer_once(self, question, lessons, None)?;
-        let (answer, confidence, mut tokens) = (first.answer, first.confidence, first.tokens);
-
-        let (answer, confidence) = if should_rethink(confidence) {
-            let second = answer_once(self, question, lessons, Some(&answer))?;
-            tokens += second.tokens;
-            (second.answer, second.confidence)
+        // The winning pass keeps its own trace; a rethink's tokens add to the
+        // first pass's so the cost is honest.
+        let chosen = if should_rethink(first.confidence) {
+            let mut second = answer_once(self, question, lessons, Some(&first.answer))?;
+            second.tokens += first.tokens;
+            second
         } else {
-            (answer, confidence)
+            first
         };
-
-        Ok(ReasoningAnswer { answer, confidence: cap_confidence(confidence), tokens })
+        Ok(ReasoningAnswer { confidence: cap_confidence(chosen.confidence), ..chosen })
     }
 }
 
@@ -412,7 +420,7 @@ fn answer_once(
         .complete(REASONING_SYSTEM, &user, None, None, cfg.temperature, cfg.seed.unwrap_or(0))
         .map_err(|e| EpisodeError::Agent(e.to_string()))?;
     let (answer, confidence) = extract_answer(&content);
-    Ok(ReasoningAnswer { answer, confidence, tokens: usage.total() })
+    Ok(ReasoningAnswer { answer, confidence, tokens: usage.total(), raw: content })
 }
 
 /// Lift the final answer and stated confidence out of a reasoning reply.
@@ -517,7 +525,7 @@ pub fn run_reasoning_episode(
     }
 
     let answer = solver.solve(&task.prompt, &cfg.lessons);
-    let (ending, correct, confidence, tokens, answer_text) = match answer {
+    let (ending, correct, confidence, tokens, answer_text, trace) = match answer {
         Ok(a) => {
             // Grading is the harness's job. `grade` returns Some for a reasoning
             // task; the None arm is unreachable here because of the guard above,
@@ -528,9 +536,9 @@ pub fn run_reasoning_episode(
             } else {
                 Ending::StepsExhausted
             };
-            (ending, correct, a.confidence.clamp(0.0, 1.0), a.tokens, Some(a.answer))
+            (ending, correct, a.confidence.clamp(0.0, 1.0), a.tokens, Some(a.answer), Some(a.raw))
         }
-        Err(e) => (Ending::AgentFailed { detail: e.to_string() }, false, 0.5, 0, None),
+        Err(e) => (Ending::AgentFailed { detail: e.to_string() }, false, 0.5, 0, None, None),
     };
 
     // The prediction is the solver's stated confidence against the oracle's
@@ -571,6 +579,7 @@ pub fn run_reasoning_episode(
         tokens,
         violations: Vec::new(),
         answer: answer_text,
+        trace,
     })
 }
 
@@ -637,7 +646,7 @@ mod reasoning_tests {
     struct Fixed(&'static str, f64);
     impl ReasoningSolver for Fixed {
         fn solve(&self, _q: &str, _l: &[String]) -> Result<ReasoningAnswer, EpisodeError> {
-            Ok(ReasoningAnswer { answer: self.0.into(), confidence: self.1, tokens: 20 })
+            Ok(ReasoningAnswer { answer: self.0.into(), confidence: self.1, tokens: 20, raw: self.0.into() })
         }
     }
 
