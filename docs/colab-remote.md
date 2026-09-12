@@ -54,10 +54,14 @@ In the `colab ssh` shell (or a notebook cell) on the runtime:
 
 ```bash
 # Ollama bundles its own CUDA — no build against Colab's stack. Its installer
-# extracts a zstd tarball and Colab lacks zstd, so install that first. Colab has
-# no systemd, so start the daemon by hand and keep the model resident.
+# extracts a zstd tarball and Colab lacks zstd, so install that first. Wipe any
+# partial prior install so the llama-server runner lands too (a partial extract
+# serves /v1 but 500s at generation with "llama-server binary not found"), then
+# confirm the runner is present. Colab has no systemd, so start the daemon by hand.
 apt-get -qq install -y zstd || (apt-get -qq update && apt-get -qq install -y zstd)
+rm -rf /usr/local/lib/ollama
 curl -fsSL https://ollama.com/install.sh | sh
+ls /usr/local/lib/ollama/llama-server   # must exist; if not, the install is broken
 OLLAMA_KEEP_ALIVE=-1 nohup ollama serve > ollama.log 2>&1 &
 # Qwen3.8-27B (Q8_0, ~30 GB) is the strong reasoning model that fits 40 GB. The
 # -mtp- build adds the multi-token-prediction draft head (self-speculative decode,
