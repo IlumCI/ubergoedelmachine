@@ -10,11 +10,14 @@ how it is positioned against the Gödel-machine literature.
 
 ## Status
 
-**The full harness is assembled.** Fourteen crates, 300 tests green. A run
-composes corpus -> episode -> reflect -> search -> certify -> ledger into one
-of three experimental arms (Solo / Critic / Adversarial), gated by the
-anytime-valid certificate and bounded by a compute budget. The only thing
-left is pointing it at a local model — which waits on cooling.
+**The full harness is assembled and running against a local model.** Sixteen
+crates, 354 tests green. A run composes corpus -> episode -> reflect -> search -> certify ->
+ledger into one of three experimental arms (Solo / Critic / Adversarial), gated
+by the anytime-valid certificate and bounded by a compute budget. The live
+Christ and Anti-Christ both drive a grammar-constrained local model; bouts feed
+a QDoRA training track, an offline knowledge base primes the adversary, and an
+earned-capability ladder gates any reach past the sandbox on trust rather than
+cleverness.
 
 Measured, not asserted: the certificate's false-certification rate is **0.022**
 against a bound of 0.05, and level-2 nested search reaches a known optimum in
@@ -27,9 +30,11 @@ RustLMHub — is in [docs/inference.md](docs/inference.md).
 | Crate | State |
 |---|---|
 | `samaritan-dsl` | decision language, input provenance, mutation grammar, NRPA policy — done |
-| `samaritan-kernel` | frozen core: routing, admission, utility, compute budget — done |
-| `samaritan-ledger` | hash-chained log, calibration, containment, experiment + frontier metrics — done |
-| `samaritan-adversary` | **The Deviant** (the Anti-Christ): a live model attacking the real guards; bouts export to a QDoRA training set — done |
+| `samaritan-kernel` | frozen core: routing, admission, utility, compute budget, capability milestones — done |
+| `samaritan-ledger` | hash-chained log, calibration, containment, experiment + frontier metrics, milestone evidence — done |
+| `samaritan-adversary` | **The Deviant** (the Anti-Christ): a live model attacking the real guards; weakened-guard foils and a multi-seed harvester feed a QDoRA training set — done |
+| `samaritan-knowledge` | offline, Deviant-only CWE knowledge base, provenance-tagged and snapshot-pinned — done |
+| `samaritan-eval` | out-of-arena capability probe (HLE), the generalisation signal and a milestone's capability half — done |
 | `samaritan-corpus` | history miner, sealed sandboxes, flake screening, splits, frontier set — done |
 | `samaritan-exec` | confined actions, container isolation, timeouts, oracle runner — done |
 | `samaritan-router` | tier dispatch, approval gating, misgrade detection, autonomy streaks — done |
@@ -85,11 +90,15 @@ crates/
   samaritan-search/   nested rollout policy adaptation over meta-levels
   samaritan-cert/     whether a self-modification may be kept
   samaritan-adversary/ the Deviant, and the arena it is caged in
+  samaritan-knowledge/ offline CWE references the Deviant may read, and nothing else may
+  samaritan-eval/     scoring the model outside the arena, on a benchmark it cannot tune to
   samaritan-reflect/  lessons mined from outcomes, never self-reported
   samaritan-run/      the whole thing, one run, one arm
 scripts/              fetch the weights, tune the split, serve
+training/             QDoRA fine-tune of the Deviant on its landed attacks (Python/Unsloth)
 config/samaritan.toml local model endpoint + arena settings
 docs/design.md        the design of record
+docs/milestones.md    the earned-capability ladder
 ```
 
 `crates/samaritan-kernel/` and `crates/samaritan-cert/` are listed in

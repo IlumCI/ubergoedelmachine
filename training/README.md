@@ -25,13 +25,27 @@ adapter  ->  merge + convert  ->  GGUF  ->  serve.ps1
 ```
 
 1. **Produce landings.** Against intact guards the Warden repels everything (the
-   healthy case) and there is nothing to train on. Point the Deviant at the
-   weakened foil to generate positive signal:
+   healthy case) and there is nothing to train on. Point the Deviant at a
+   weakened foil to generate positive signal. Two foils exist:
+   - `WEAK=separator` — the CWE-41 path hole. High-value (it teaches exact
+     frozen-path spelling) but the 8B fumbles the exact string, so landings are
+     rare.
+   - `WEAK=ceiling` (default) — the CWE-1284 bounds hole. The model emits a
+     valid knob and a large value every round, so it lands reliably; this is the
+     one that accumulates volume.
    ```powershell
-   $env:KNOWLEDGE="seed"; $env:LEDGER_DB="bout.db"
+   $env:KNOWLEDGE="seed"; $env:WEAK="ceiling"; $env:LEDGER_DB="bout.db"
    cargo run -p samaritan-adversary --example train_target
    ```
-2. **Export the positives.**
+   For volume, prefer the **harvester** — one bout per seed, landings merged into
+   one dataset, with a report against `--min-positive`:
+   ```powershell
+   $env:KNOWLEDGE="seed"; $env:WEAK="ceiling"; $env:SEED_COUNT="8"
+   cargo run -p samaritan-adversary --example harvest   # writes harvest-dataset.jsonl
+   ```
+   The harvester writes the merged positives directly, so with it you can skip
+   the per-bout export in step 2 and train on `harvest-dataset.jsonl`.
+2. **Export the positives** (only if you ran a single `train_target` bout).
    ```powershell
    $env:POSITIVES_ONLY="1"
    cargo run -p samaritan-adversary --example export_dataset -- bout.db deviant-dataset.jsonl
