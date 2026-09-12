@@ -1,8 +1,11 @@
 # Samaritan: a nested-certificate Gödel machine
 
-> Status: M0-M3 complete, 251 tests green. This document is the design of record; where it
-> disagrees with the original plan, this document is correct — it has been
-> reconciled against a prior-art survey (see [Positioning](#positioning)).
+> Status: M0-M3 complete and running against a local model; 364 tests green.
+> Beyond the core, the harness now has a live adversary, an offline knowledge
+> base, an out-of-arena capability probe (HLE), and an earned-capability
+> milestone ladder. This document is the design of record; where it disagrees
+> with the original plan, this document is correct — it has been reconciled
+> against a prior-art survey (see [Positioning](#positioning)).
 
 ## What this is
 
