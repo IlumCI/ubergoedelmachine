@@ -42,11 +42,15 @@
 //! Nothing here commits anything. A search returns a *candidate*; whether it
 //! may be kept is `samaritan-cert`'s decision.
 
+pub mod codepatch;
 pub mod state;
 
 use samaritan_dsl::{Mutation, MutationCode, MutationPolicy};
 use serde::{Deserialize, Serialize};
 
+pub use codepatch::{
+    AcceptedPatch, PatchRefusal, PatchReport, PatchVerifier, gate_code_patch,
+};
 pub use state::{Grammar, GrammarOp, Lesson, PolicyState};
 
 /// What a rollout chose, and what it could have chosen at each step.
