@@ -1,0 +1,12 @@
+[package]
+name = "samaritan-eval"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+samaritan-agent = { version = "0.1.0", path = "../samaritan-agent" }
+samaritan-ledger = { version = "0.1.0", path = "../samaritan-ledger" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
