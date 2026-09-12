@@ -4,11 +4,13 @@
 > Levels 2 and 3 are no longer designed-for — the grammar is data the search
 > can edit *and* `search_grammar` searches over it, scoring a grammar by the
 > level-1 search it produces; a code patch to the search's own source runs
-> through a screen-build-test-human gate with a real worktree verifier. Two
-> things are deliberately still missing before M4/M5 can be called done: the
-> **cadence** (nothing schedules a level-2 or level-3 search inside a run yet)
-> and a **level-3 proposer** (the gate and verifier exist; nothing generates
-> candidate patches).
+> through a screen-build-test-human gate with a real worktree verifier. The level-3 loop
+> is now complete end to end — a `GenerativePatchProposer` has the local model
+> write a unified diff against one of the search's own files, and the
+> screen-build-test-human gate disposes of it. One thing is still deliberately
+> missing before M4/M5 can be called done: the **cadence** — nothing yet
+> *schedules* a level-2 or level-3 search inside a run; the mechanisms are
+> callable but a run still only drives level 1.
 > Beyond the core, the harness now has a live adversary, an offline knowledge
 > base, an out-of-arena capability probe (HLE), and an earned-capability
 > milestone ladder. This document is the design of record; where it disagrees
