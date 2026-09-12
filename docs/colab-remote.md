@@ -13,12 +13,11 @@ calls.
 ## The turnkey path (start here)
 
 **[`docs/colab/samaritan_a100.ipynb`](colab/samaritan_a100.ipynb)** is a run-all
-notebook that does the whole serve side: install vLLM, pick the model, generate a
-key, launch the server, open a cloudflared tunnel, and print the exact
-`SAMARITAN_URL` / `SAMARITAN_API_KEY` lines to paste locally. Open it in Colab
-(Runtime → A100), Run all, wait for the tunnel URL. No WSL, no CLI. The sections
-below are the manual / scriptable version of the same thing, plus the CLI route
-for people who want it.
+notebook that does the whole serve side: install Ollama, pull **Qwen3.8-27B
+(Q8_0)**, alias it to `samaritan-playout`, open a cloudflared tunnel, and print the
+exact `SAMARITAN_URL` line to paste locally. Open it in Colab (Runtime → A100), Run
+all, wait for the tunnel URL. No WSL, no CLI. The sections below are the manual /
+scriptable version of the same thing, plus the CLI route for people who want it.
 
 ## Read these constraints first
 
@@ -32,6 +31,11 @@ for people who want it.
   persistent solver would want a rented VPS later.
 - Flags/behaviour below are from the repo README; anything it doesn't state,
   confirm with `colab <cmd> --help` on your install rather than trusting me.
+- **Serve GGUF via Ollama, not FP8 via vLLM.** The A100 is Ampere (SM80) with no
+  FP8 tensor cores, and vLLM has **no FP8-MoE support on Ampere** — an FP8 MoE
+  checkpoint (e.g. Qwen3-30B-A3B-FP8) downloads ~30 GB and then *crashes at load*
+  (vLLM issue #35922). Ollama runs the GGUF reliably, bundles its own CUDA, and
+  needs no build. Dense FP8 would run on vLLM via Marlin; MoE FP8 does not.
 
 ## Provision the A100 (the CLI, in WSL)
 
@@ -49,40 +53,43 @@ colab ssh -s samaritan               # a shell on the runtime
 In the `colab ssh` shell (or a notebook cell) on the runtime:
 
 ```bash
-pip -q install vllm
-# Qwen3-30B-A3B-Thinking (FP8) is the strong reasoning model that fits 40 GB: an
-# MoE, 30B total but ~3B active/token, so far stronger than the 4B and still fast.
-# vLLM runs its FP8 weights weight-only via Marlin on the A100 (Ampere has no FP8
-# compute units). --served-model-name is the alias the harness asks for, so
-# nothing changes on our side. A key so the public tunnel URL is not open.
-KEY=$(python -c "import secrets;print(secrets.token_urlsafe(24))"); echo "API KEY: $KEY"
-nohup python -m vllm.entrypoints.openai.api_server \
-    --model Qwen/Qwen3-30B-A3B-Thinking-2507-FP8 \
-    --served-model-name samaritan-playout \
-    --api-key "$KEY" --port 8000 --max-model-len 8192 > vllm.log 2>&1 &
-# wait for "Uvicorn running" in vllm.log, then publish the port:
+# Ollama bundles its own CUDA — no build against Colab's stack. Colab has no
+# systemd, so start the daemon by hand and keep the model resident.
+curl -fsSL https://ollama.com/install.sh | sh
+OLLAMA_KEEP_ALIVE=-1 nohup ollama serve > ollama.log 2>&1 &
+# Qwen3.8-27B (Q8_0, ~30 GB) is the strong reasoning model that fits 40 GB. Copy it
+# to samaritan-playout (the alias the harness asks for) with a 16k context baked in,
+# since it thinks hard by default and we don't want traces truncated.
+ollama pull qwen3.8:27b-q8_0
+printf 'FROM qwen3.8:27b-q8_0\nPARAMETER num_ctx 16384\n' > Modelfile
+ollama create samaritan-playout -f Modelfile
+# publish port 11434:
 wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O cloudflared && chmod +x cloudflared
-./cloudflared tunnel --url http://localhost:8000    # prints a https://<random>.trycloudflare.com URL
+./cloudflared tunnel --url http://localhost:11434   # prints a https://<random>.trycloudflare.com URL
 ```
 
-Model choice, honestly: **Qwen3-30B-A3B-Thinking-2507 (FP8)** is the sweet spot on
-a 40 GB A100 — a large step up from the 4B on p2/GPQA, and because it's an MoE with
-only ~3B active per token it stays fast under vLLM. There is **no** Qwen3-14B-
-Thinking (checked on HF): the 30B-A3B MoE is the real next rung above the 4B. If it
-OOMs on a given runtime, lower `--max-model-len` or fall back to
-`Qwen/Qwen3-4B-Thinking-2507` (trivially fits, but it's the local class — little
-lift). Bench p2 with whatever you serve and keep what wins per unit time.
+Model choice, honestly: **Qwen3.8-27B (Q8_0 GGUF)** is the sweet spot on a 40 GB
+A100 — a large step up from the 4B on p2/GPQA, and Q8_0 (~30 GB) fits with room for
+context. There is no Q6_K in the Ollama library for the 27B and bf16 (56 GB) won't
+fit, so Q8_0 is the tag to use; `qwen3.8:27b` (Q4_K_M, 18 GB) is the lighter
+fallback. We serve GGUF via Ollama rather than FP8 via vLLM because vLLM has no
+FP8-MoE support on the A100 (see the constraints above). Ollama has **no API-key
+auth**, so the random tunnel URL is the only guard — stop the runtime when done.
 
 ## Point the harness at it (local, any OS)
 
 ```powershell
 $env:SAMARITAN_URL = "https://<random>.trycloudflare.com/v1"   # the tunnel URL + /v1
-$env:SAMARITAN_API_KEY = "<the KEY printed above>"
+$env:SAMARITAN_API_KEY = "ollama"                              # any value; Ollama ignores it
+$env:MAX_TOKENS = "8192"                                       # Qwen3.8 thinks a lot
 $env:DATASET = "$env:USERPROFILE\models\reasoning\gsm-symbolic-p2.jsonl"
-cargo run -p samaritan-run --example reason_eval    # now answered by the 14B on the A100
+cargo run -p samaritan-run --example reason_eval    # now answered by Qwen3.8-27B on the A100
 ```
 
-No `serve.ps1` at the same time (that's the local 4B). This is the first real read
+Qwen recommends temp 1.0 / top_p 0.95 / top_k 20 / repeat 1.0 for this model in
+thinking mode; `reason_eval` currently sends 0.6 / 1.1 (tuned for the local 4B),
+which is fine for a first read. No `serve.ps1` at the same time (that's the local
+4B). This is the first real read
 from a *capable* substrate — it should crush the 4B's 2/10 on p2.
 
 ## Train on the same runtime
@@ -106,7 +113,7 @@ fully cross-platform; the CLI is just the scriptable version of it.
 
 ## Housekeeping
 
-- The API key is what protects the public tunnel URL — don't paste it anywhere
-  shared, and rotate it per session.
-- `colab stop -s samaritan` (or kill the vLLM + cloudflared processes) when done;
-  a forgotten A100 burns Pro+ compute units fast.
+- Ollama has no auth, so the random tunnel URL is the *only* thing guarding the
+  endpoint — don't paste it anywhere shared, and it changes each session anyway.
+- `colab stop -s samaritan` (or kill the `ollama serve` + cloudflared processes,
+  or just stop the runtime) when done; a forgotten A100 burns Pro+ units fast.
