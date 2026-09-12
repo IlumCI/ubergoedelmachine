@@ -57,11 +57,12 @@ In the `colab ssh` shell (or a notebook cell) on the runtime:
 # systemd, so start the daemon by hand and keep the model resident.
 curl -fsSL https://ollama.com/install.sh | sh
 OLLAMA_KEEP_ALIVE=-1 nohup ollama serve > ollama.log 2>&1 &
-# Qwen3.8-27B (Q8_0, ~30 GB) is the strong reasoning model that fits 40 GB. Copy it
-# to samaritan-playout (the alias the harness asks for) with a 16k context baked in,
-# since it thinks hard by default and we don't want traces truncated.
-ollama pull qwen3.8:27b-q8_0
-printf 'FROM qwen3.8:27b-q8_0\nPARAMETER num_ctx 16384\n' > Modelfile
+# Qwen3.8-27B (Q8_0, ~30 GB) is the strong reasoning model that fits 40 GB. The
+# -mtp- build adds the multi-token-prediction draft head (self-speculative decode,
+# faster gen at equal quality). Copy it to samaritan-playout (the alias the harness
+# asks for) with a 16k context baked in — it thinks hard by default.
+ollama pull qwen3.8:27b-mtp-q8_0
+printf 'FROM qwen3.8:27b-mtp-q8_0\nPARAMETER num_ctx 16384\n' > Modelfile
 ollama create samaritan-playout -f Modelfile
 # publish port 11434:
 wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O cloudflared && chmod +x cloudflared
@@ -70,11 +71,16 @@ wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloud
 
 Model choice, honestly: **Qwen3.8-27B (Q8_0 GGUF)** is the sweet spot on a 40 GB
 A100 — a large step up from the 4B on p2/GPQA, and Q8_0 (~30 GB) fits with room for
-context. There is no Q6_K in the Ollama library for the 27B and bf16 (56 GB) won't
-fit, so Q8_0 is the tag to use; `qwen3.8:27b` (Q4_K_M, 18 GB) is the lighter
-fallback. We serve GGUF via Ollama rather than FP8 via vLLM because vLLM has no
-FP8-MoE support on the A100 (see the constraints above). Ollama has **no API-key
-auth**, so the random tunnel URL is the only guard — stop the runtime when done.
+context. The `-mtp-` build is the one to serve: same weights, plus a multi-token-
+prediction draft head for self-speculative decoding (faster generation at equal
+quality). There is no Q6_K in the Ollama library for the 27B and bf16 (56 GB) won't
+fit, so Q8_0 is the tag; plain `qwen3.8:27b-q8_0` (no MTP) or `qwen3.8:27b`
+(Q4_K_M, 18 GB) are fallbacks. We serve GGUF via Ollama rather than FP8 via vLLM
+because vLLM has no FP8-MoE support on the A100 (see the constraints above). To read
+real throughput, hit Ollama's native `/api/chat` (`stream:false`) and divide
+`eval_count` by `eval_duration` — that's server-side, so it's clean decode speed.
+Ollama has **no API-key auth**, so the random tunnel URL is the only guard — stop
+the runtime when done.
 
 ## Point the harness at it (local, any OS)
 
