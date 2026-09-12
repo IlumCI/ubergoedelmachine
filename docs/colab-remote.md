@@ -10,6 +10,16 @@ Keeps the cheap+strong split the design always wanted: the local 4B does the
 thousands of cheap level-0 playouts; the A100 model takes the hard reasoning
 calls.
 
+## The turnkey path (start here)
+
+**[`docs/colab/samaritan_a100.ipynb`](colab/samaritan_a100.ipynb)** is a run-all
+notebook that does the whole serve side: install vLLM, pick the model, generate a
+key, launch the server, open a cloudflared tunnel, and print the exact
+`SAMARITAN_URL` / `SAMARITAN_API_KEY` lines to paste locally. Open it in Colab
+(Runtime → A100), Run all, wait for the tunnel URL. No WSL, no CLI. The sections
+below are the manual / scriptable version of the same thing, plus the CLI route
+for people who want it.
+
 ## Read these constraints first
 
 - **The official `google-colab-cli` is Linux/macOS only — not Windows.** On this
@@ -40,12 +50,14 @@ In the `colab ssh` shell (or a notebook cell) on the runtime:
 
 ```bash
 pip -q install vllm
-# Qwen3-14B-Thinking fits fp16-ish on 40 GB; a 32B fits 4-bit. --served-model-name
-# is the alias the harness asks for, so nothing changes on our side. A key so the
-# public tunnel URL is not open to the world.
+# Qwen3-30B-A3B-Thinking (FP8) is the strong reasoning model that fits 40 GB: an
+# MoE, 30B total but ~3B active/token, so far stronger than the 4B and still fast.
+# vLLM runs its FP8 weights weight-only via Marlin on the A100 (Ampere has no FP8
+# compute units). --served-model-name is the alias the harness asks for, so
+# nothing changes on our side. A key so the public tunnel URL is not open.
 KEY=$(python -c "import secrets;print(secrets.token_urlsafe(24))"); echo "API KEY: $KEY"
 nohup python -m vllm.entrypoints.openai.api_server \
-    --model Qwen/Qwen3-14B-Thinking-2507 \
+    --model Qwen/Qwen3-30B-A3B-Thinking-2507-FP8 \
     --served-model-name samaritan-playout \
     --api-key "$KEY" --port 8000 --max-model-len 8192 > vllm.log 2>&1 &
 # wait for "Uvicorn running" in vllm.log, then publish the port:
@@ -53,10 +65,13 @@ wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloud
 ./cloudflared tunnel --url http://localhost:8000    # prints a https://<random>.trycloudflare.com URL
 ```
 
-Model choice, honestly: **Qwen3-14B-Thinking** is the sweet spot on a 40 GB
-A100 — a large step up from the 4B on p2/GPQA, comfortable, fast under vLLM. A 32B
-(4-bit) reasons better still, slower. Bench p2 with each and keep whichever wins
-per unit time.
+Model choice, honestly: **Qwen3-30B-A3B-Thinking-2507 (FP8)** is the sweet spot on
+a 40 GB A100 — a large step up from the 4B on p2/GPQA, and because it's an MoE with
+only ~3B active per token it stays fast under vLLM. There is **no** Qwen3-14B-
+Thinking (checked on HF): the 30B-A3B MoE is the real next rung above the 4B. If it
+OOMs on a given runtime, lower `--max-model-len` or fall back to
+`Qwen/Qwen3-4B-Thinking-2507` (trivially fits, but it's the local class — little
+lift). Bench p2 with whatever you serve and keep what wins per unit time.
 
 ## Point the harness at it (local, any OS)
 
