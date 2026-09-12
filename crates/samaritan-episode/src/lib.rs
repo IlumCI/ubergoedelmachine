@@ -338,6 +338,21 @@ Confidence: <a number from 0 to 1>\n\
 State a low confidence when unsure. A confident wrong answer is worse than an \
 honest low-confidence one.";
 
+/// There is no 100 % confidence. A stated confidence at or above this is not
+/// evidence, it is a tell — an overconfident model says it about everything —
+/// so it is never recorded, and it triggers a second, skeptical pass.
+pub const CONFIDENCE_CAP: f64 = 0.95;
+
+/// Whether a stated confidence is high enough to distrust and re-reason.
+pub fn should_rethink(confidence: f64) -> bool {
+    confidence >= CONFIDENCE_CAP
+}
+
+/// The recorded confidence, never above the cap.
+pub fn cap_confidence(confidence: f64) -> f64 {
+    confidence.min(CONFIDENCE_CAP)
+}
+
 /// The live solver: the local model, through [`samaritan_agent::Agent`].
 ///
 /// The reasoning counterpart of `impl Decider for Agent`. It runs one
@@ -345,20 +360,59 @@ honest low-confidence one.";
 /// out of the reply — tolerant of a `<think>...</think>` block (Qwen3-Thinking
 /// and friends emit one) and of the prose a chat model wraps around its answer.
 /// It never grades itself; grading is [`Task::grade`]'s, in the episode.
+///
+/// Confidence discipline: a first pass that comes back at or above
+/// [`CONFIDENCE_CAP`] is not trusted — the model is told it was overconfident
+/// and made to re-examine its own answer skeptically, and the reconsidered
+/// answer is taken. Recorded confidence is always capped, because certainty is
+/// not a thing a calibrated solver claims. The cost is a second completion on
+/// the over-sure items, which is exactly where the confident-wrong errors — the
+/// ones a hard exam punishes most — hide.
 impl ReasoningSolver for samaritan_agent::Agent {
     fn solve(&self, question: &str, lessons: &[String]) -> Result<ReasoningAnswer, EpisodeError> {
-        let user = if lessons.is_empty() {
-            question.to_string()
+        let first = answer_once(self, question, lessons, None)?;
+        let (answer, confidence, mut tokens) = (first.answer, first.confidence, first.tokens);
+
+        let (answer, confidence) = if should_rethink(confidence) {
+            let second = answer_once(self, question, lessons, Some(&answer))?;
+            tokens += second.tokens;
+            (second.answer, second.confidence)
         } else {
-            format!("{}\n\nKeep in mind:\n- {}", question, lessons.join("\n- "))
+            (answer, confidence)
         };
-        let cfg = self.config();
-        let (content, usage) = self
-            .complete(REASONING_SYSTEM, &user, None, None, cfg.temperature, cfg.seed.unwrap_or(0))
-            .map_err(|e| EpisodeError::Agent(e.to_string()))?;
-        let (answer, confidence) = extract_answer(&content);
-        Ok(ReasoningAnswer { answer, confidence, tokens: usage.total() })
+
+        Ok(ReasoningAnswer { answer, confidence: cap_confidence(confidence), tokens })
     }
+}
+
+/// One reasoning completion through the agent. `reconsider` carries a prior
+/// answer to re-examine — the skeptical second pass. A free function rather than
+/// a method because `Agent` is defined in another crate.
+fn answer_once(
+    agent: &samaritan_agent::Agent,
+    question: &str,
+    lessons: &[String],
+    reconsider: Option<&str>,
+) -> Result<ReasoningAnswer, EpisodeError> {
+    let mut user = question.to_string();
+    if !lessons.is_empty() {
+        user.push_str(&format!("\n\nKeep in mind:\n- {}", lessons.join("\n- ")));
+    }
+    if let Some(prior) = reconsider {
+        user.push_str(&format!(
+            "\n\nYour first answer was: {prior}\nYou were highly confident, but \
+             overconfidence is a common failure and certainty is never warranted. \
+             Re-examine skeptically — look for an error, a missed case, or a wrong \
+             assumption. Then give your final answer and a calibrated confidence no \
+             higher than 0.95."
+        ));
+    }
+    let cfg = agent.config();
+    let (content, usage) = agent
+        .complete(REASONING_SYSTEM, &user, None, None, cfg.temperature, cfg.seed.unwrap_or(0))
+        .map_err(|e| EpisodeError::Agent(e.to_string()))?;
+    let (answer, confidence) = extract_answer(&content);
+    Ok(ReasoningAnswer { answer, confidence, tokens: usage.total() })
 }
 
 /// Lift the final answer and stated confidence out of a reasoning reply.
@@ -369,50 +423,76 @@ impl ReasoningSolver for samaritan_agent::Agent {
 /// when unstated, never to a flattering high value.
 pub fn extract_answer(content: &str) -> (String, f64) {
     // Everything after the last </think> is the answer proper; if there is no
-    // think block, the whole reply is.
+    // think block, the whole reply is. Confidence is scanned over the whole
+    // reply, since a model sometimes states it inside the thinking.
     let body = match content.rfind("</think>") {
         Some(i) => &content[i + "</think>".len()..],
         None => content,
     };
-    let confidence = parse_confidence(body).unwrap_or(0.5);
-    let answer = marker_value(body, "answer:")
-        .or_else(|| marker_value(body, "final answer:"))
-        .unwrap_or_else(|| last_nonempty_line(body))
-        .trim()
-        .to_string();
+    let confidence = parse_confidence(content).unwrap_or(0.5);
+    // Prefer the answer from the post-think body; fall back to the whole reply
+    // for a model that answered inside its thinking and emitted only a
+    // confidence line after.
+    let answer = answer_from(body).or_else(|| answer_from(content)).unwrap_or_default();
     (answer, confidence)
 }
 
-/// The text after a case-insensitive `marker` on the last line that carries it.
-fn marker_value(text: &str, marker: &str) -> Option<String> {
-    let mut found = None;
-    for line in text.lines() {
+/// The final answer in a block of text, or `None` if there is nothing usable.
+///
+/// Handles the shapes a chat model actually produces: `Answer: X` inline,
+/// `Answer:` with the value on the next line, and no marker at all (take the
+/// last real line). It never returns the `Confidence:` line — the bug the first
+/// live run exposed, where a bare `Answer:` sent the fallback onto the trailing
+/// confidence line and graded a correct answer as wrong.
+fn answer_from(text: &str) -> Option<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    for (i, line) in lines.iter().enumerate() {
         let lower = line.to_lowercase();
-        if let Some(pos) = lower.find(marker) {
-            // Take from the original line so the answer's own casing survives.
-            found = Some(line[pos + marker.len()..].trim().to_string());
+        let pos = lower.find("answer:").or_else(|| lower.find("final answer:"));
+        if let Some(pos) = pos {
+            let after = lower[pos..].find(':').map(|c| pos + c + 1).unwrap_or(pos);
+            let inline = line[after..].trim();
+            if !inline.is_empty() {
+                return Some(inline.to_string());
+            }
+            // `Answer:` with the value on a following line.
+            for next in &lines[i + 1..] {
+                let t = next.trim();
+                if !t.is_empty() && !is_confidence_line(t) {
+                    return Some(t.to_string());
+                }
+            }
         }
     }
-    found.filter(|s| !s.is_empty())
+    // No marker: the last non-empty line that is not the confidence line.
+    lines
+        .iter()
+        .rev()
+        .map(|l| l.trim())
+        .find(|l| !l.is_empty() && !is_confidence_line(l))
+        .map(|s| s.to_string())
+}
+
+fn is_confidence_line(line: &str) -> bool {
+    line.to_lowercase().trim_start_matches(['*', '#', '-', ' ']).starts_with("confidence:")
 }
 
 fn parse_confidence(text: &str) -> Option<f64> {
-    let v = marker_value(text, "confidence:")?;
+    // The last confidence line wins.
+    let mut value = None;
+    for line in text.lines() {
+        let lower = line.to_lowercase();
+        if let Some(pos) = lower.find("confidence:") {
+            value = Some(line[pos + "confidence:".len()..].trim().to_string());
+        }
+    }
+    let v = value?;
     // The value may be "0.8", "0.8 (high)", "80%"; take the leading number.
-    let token: String = v.trim().chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+    let token: String = v.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
     let n: f64 = token.parse().ok()?;
     // A percentage if it came in as 0-100.
     let n = if n > 1.0 { n / 100.0 } else { n };
     Some(n.clamp(0.0, 1.0))
-}
-
-fn last_nonempty_line(text: &str) -> String {
-    text.lines()
-        .rev()
-        .map(|l| l.trim())
-        .find(|l| !l.is_empty())
-        .unwrap_or("")
-        .to_string()
 }
 
 /// Run one reasoning task to a score.
@@ -640,6 +720,35 @@ mod reasoning_tests {
     fn extract_answer_preserves_answer_casing() {
         let (a, _) = extract_answer("answer: Marie Curie\nconfidence: 0.7");
         assert_eq!(a, "Marie Curie");
+    }
+
+    #[test]
+    fn extract_answer_never_returns_the_confidence_line() {
+        // The exact shape that broke the first live run: a bare `Answer:` with
+        // the value on the next line, then a Confidence line. The old fallback
+        // grabbed "Confidence: 1" and graded a correct answer as wrong.
+        let (a, c) = extract_answer("<think>...</think>\nAnswer:\nParis\nConfidence: 1");
+        assert_eq!(a, "Paris");
+        assert!((c - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn extract_answer_ignores_a_markdown_confidence_line_in_the_fallback() {
+        // No Answer marker, answer in prose, then a decorated confidence line.
+        let (a, _) = extract_answer("The capital is Paris.\n**Confidence:** 0.9");
+        assert_eq!(a, "The capital is Paris.");
+    }
+
+    #[test]
+    fn confidence_is_capped_and_high_confidence_triggers_a_rethink() {
+        // No 100%: the recorded confidence never exceeds the cap.
+        assert_eq!(cap_confidence(1.0), CONFIDENCE_CAP);
+        assert_eq!(cap_confidence(0.99), CONFIDENCE_CAP);
+        assert!((cap_confidence(0.7) - 0.7).abs() < 1e-9);
+        // At or above the cap is distrusted and re-reasoned; below is taken.
+        assert!(should_rethink(1.0));
+        assert!(should_rethink(0.95));
+        assert!(!should_rethink(0.9));
     }
 
     #[test]
