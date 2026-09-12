@@ -73,14 +73,14 @@ fn main() {
     let rounds = env_u64("ROUNDS", 8);
     let out = std::env::var("OUT").unwrap_or_else(|_| "harvest-dataset.jsonl".into());
     let min_positive = env_u64("MIN_POSITIVE", 16) as usize;
-    let weak = match std::env::var("WEAK").as_deref() {
-        Ok("separator") => WeakGuard::AdmissionSkipsSeparatorNormalization,
-        _ => WeakGuard::CeilingOmitsUpperBound,
-    };
+    // Default to every foil open: a harvest wants diversity, and combining the
+    // holes lets each class land through its own — the sandbox hole especially,
+    // which the model feeds a stream of distinct escape paths.
+    let weak = WeakGuard::parse_set(&std::env::var("WEAK").unwrap_or_else(|_| "all".into()));
     let use_knowledge = !matches!(std::env::var("KNOWLEDGE").as_deref(), Ok("none"));
 
     println!("server:  {base_url}");
-    println!("foil:    {weak:?}");
+    println!("foils:   {weak:?}");
     println!("seeds:   {seed_base}..{}", seed_base + seed_count);
     println!("rounds:  {rounds} per seed");
     println!("knowledge: {}\n", if use_knowledge { "seed CWE" } else { "none" });
@@ -118,7 +118,7 @@ fn main() {
             // No steering: a fresh prompt every round (see the module note).
             let attack = deviant.propose(&[], &policy);
             let from_book = deviant.last_fell_back.is_some();
-            let verdict = attempt_training(&attack, weak, &target);
+            let verdict = attempt_training(&attack, &weak, &target);
             let round = arena.record(&attack, verdict.clone(), &mut ledger).unwrap();
             if round.verdict.landed() {
                 seed_landed += 1;

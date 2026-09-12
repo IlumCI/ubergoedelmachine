@@ -147,14 +147,14 @@ impl Arena {
     pub fn step_training(
         &mut self,
         attacker: &mut dyn Attacker,
-        weak: WeakGuard,
+        weaknesses: &[WeakGuard],
         target: &Target,
         policy: &samaritan_dsl::MutationPolicy,
         ledger: &mut Ledger,
     ) -> Result<Round, LedgerError> {
         let known: Vec<ExploitClass> = self.breached.iter().copied().collect();
         let attack = attacker.propose(&known, policy);
-        let verdict = attempt_training(&attack, weak, target);
+        let verdict = attempt_training(&attack, weaknesses, target);
         self.record(&attack, verdict, ledger)
     }
 

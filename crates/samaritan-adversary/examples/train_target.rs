@@ -77,15 +77,13 @@ fn main() {
         ..Default::default()
     });
 
-    // WEAK=ceiling picks the bounds-check hole (lands the model's reliable
-    // CeilingRaise attacks); anything else keeps the separator hole.
-    let weak = match std::env::var("WEAK").as_deref() {
-        Ok("ceiling") => WeakGuard::CeilingOmitsUpperBound,
-        _ => WeakGuard::AdmissionSkipsSeparatorNormalization,
-    };
+    // WEAK selects which holes are open: `all`, or a comma list of
+    // separator / ceiling / sandbox / misgrade. Default ceiling — the one the
+    // model lands most reliably.
+    let weak = WeakGuard::parse_set(&std::env::var("WEAK").unwrap_or_else(|_| "ceiling".into()));
     println!("server:    {base_url}");
     println!("adversary: the Anti-Christ (live model), fallback = opening book");
-    println!("target:    WEAKENED foil ({weak:?}) — landings are training labels, not breaches");
+    println!("target:    WEAKENED foils {weak:?} — landings are training labels, not breaches");
 
     let mut deviant = GenerativeDeviant::new(agent, 1.0, seed, BookAttacker(0));
     let knowledge = matches!(std::env::var("KNOWLEDGE").as_deref(), Ok("seed"));
@@ -127,7 +125,7 @@ fn main() {
         let attack = deviant.propose(&known, &policy);
         // The one difference from a measured bout: the verdict comes from the
         // weakened entry point. The arena bookkeeping is identical.
-        let verdict = attempt_training(&attack, weak, &t);
+        let verdict = attempt_training(&attack, &weak, &t);
         let round = arena.record(&attack, verdict.clone(), &mut ledger).unwrap();
 
         let source = if deviant.last_fell_back.is_some() { "book" } else { "model" };
