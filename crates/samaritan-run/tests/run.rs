@@ -40,6 +40,7 @@ fn outcome(solved: bool, confidence: f64, tokens: u64) -> EpisodeOutcome {
         predictions: vec![(confidence, solved)],
         tokens,
         violations: vec![],
+        answer: None,
     }
 }
 
