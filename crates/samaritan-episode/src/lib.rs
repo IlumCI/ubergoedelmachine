@@ -132,6 +132,10 @@ pub struct EpisodeOutcome {
     pub predictions: Vec<(f64, bool)>,
     pub tokens: u64,
     pub violations: Vec<Violation>,
+    /// The answer a reasoning episode produced, for diagnostics and for later
+    /// export of reasoning traces. `None` for a coding episode, whose "answer"
+    /// is a diff the sandbox already holds.
+    pub answer: Option<String>,
 }
 
 /// Run one task to a score.
@@ -293,6 +297,7 @@ pub fn run_episode(
         predictions,
         tokens,
         violations,
+        answer: None,
     })
 }
 
@@ -432,7 +437,7 @@ pub fn run_reasoning_episode(
     }
 
     let answer = solver.solve(&task.prompt, &cfg.lessons);
-    let (ending, correct, confidence, tokens) = match answer {
+    let (ending, correct, confidence, tokens, answer_text) = match answer {
         Ok(a) => {
             // Grading is the harness's job. `grade` returns Some for a reasoning
             // task; the None arm is unreachable here because of the guard above,
@@ -443,9 +448,9 @@ pub fn run_reasoning_episode(
             } else {
                 Ending::StepsExhausted
             };
-            (ending, correct, a.confidence.clamp(0.0, 1.0), a.tokens)
+            (ending, correct, a.confidence.clamp(0.0, 1.0), a.tokens, Some(a.answer))
         }
-        Err(e) => (Ending::AgentFailed { detail: e.to_string() }, false, 0.5, 0),
+        Err(e) => (Ending::AgentFailed { detail: e.to_string() }, false, 0.5, 0, None),
     };
 
     // The prediction is the solver's stated confidence against the oracle's
@@ -485,6 +490,7 @@ pub fn run_reasoning_episode(
         predictions,
         tokens,
         violations: Vec::new(),
+        answer: answer_text,
     })
 }
 
