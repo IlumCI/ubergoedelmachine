@@ -443,6 +443,26 @@ pub enum Event {
         succeeded: bool,
     },
 
+    /// A capability evaluation on a held-out benchmark outside the arena —
+    /// today, Humanity's Last Exam.
+    ///
+    /// This is the *generalisation* signal: reasoning that has nothing to do
+    /// with the repo surface the machine trains on, so a rising score is
+    /// capability that transferred out of the environment rather than a policy
+    /// tuned to it. It is the capability half of an outward milestone
+    /// ([`samaritan_kernel::Capability`]) — necessary there, never sufficient —
+    /// and otherwise a dashboard number, never a thing that grants reach by
+    /// itself.
+    HleEvaluated {
+        /// Fraction correct, `[0, 1]`.
+        score: f64,
+        /// How many questions it was measured over, so a small sample is
+        /// visible rather than implied.
+        questions: u32,
+        /// Which model produced it, since the score belongs to a checkpoint.
+        model: String,
+    },
+
     // ------------------------------------------------------------- system
     /// Startup. The kernel hash is pinned here; a later run that reads a
     /// different hash for the same claimed version has been tampered with.

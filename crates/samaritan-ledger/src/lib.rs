@@ -531,6 +531,58 @@ impl Ledger {
         v.dedup();
         Ok(v)
     }
+
+    /// The measured evidence a milestone gate is judged against.
+    ///
+    /// Bridges the ledger's record to the kernel's pure [`Evidence`]. Every
+    /// field is read from rows the agent did not author the verdict of: a
+    /// calibration pair joins a *pre-stated* confidence to an *oracle* outcome,
+    /// a committed mutation cleared its certificate to be applied, a clean
+    /// generation is a round the containment held whole. The kernel decides
+    /// eligibility from this; the ledger only reports what happened.
+    pub fn milestone_evidence(&self) -> Result<samaritan_kernel::Evidence, LedgerError> {
+        // Calibration is worst-case until there is data to say otherwise, so a
+        // tier gated on it cannot pass on an empty record.
+        let brier_score = brier(&self.calibration_pairs()?).unwrap_or(1.0);
+
+        // A committed mutation is one that cleared its Ville certificate.
+        let certified_selfmods = self.by_kind("mutation_committed")?.len() as u32;
+
+        // The trailing run of whole-containment rounds. A single real landing
+        // resets it: trust is the recent record, not the lifetime average.
+        let clean_generations = trailing_clean_generations(&self.containment_history()?);
+
+        // The most recent capability evaluation, or none run yet.
+        let hle_score = self
+            .by_kind("hle_evaluated")?
+            .into_iter()
+            .filter_map(|e| match e.event {
+                Event::HleEvaluated { score, .. } => Some(score),
+                _ => None,
+            })
+            .last()
+            .unwrap_or(0.0);
+
+        Ok(samaritan_kernel::Evidence {
+            hle_score,
+            clean_generations,
+            brier: brier_score,
+            certified_selfmods,
+        })
+    }
+}
+
+/// The trailing count of rounds whose containment index was whole.
+///
+/// Reads from the most recent round backward and stops at the first breach, so
+/// it is the *current* clean streak rather than a lifetime tally — the number a
+/// trust gate should care about.
+fn trailing_clean_generations(history: &[(u64, f64)]) -> u32 {
+    history
+        .iter()
+        .rev()
+        .take_while(|(_, index)| *index >= 1.0)
+        .count() as u32
 }
 
 /// Brier score over settled predictions. Lower is better; 0.25 is what you get
