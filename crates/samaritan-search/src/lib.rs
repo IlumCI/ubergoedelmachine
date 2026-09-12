@@ -47,7 +47,7 @@ pub mod state;
 use samaritan_dsl::{Mutation, MutationCode, MutationPolicy};
 use serde::{Deserialize, Serialize};
 
-pub use state::{Lesson, PolicyState};
+pub use state::{Grammar, GrammarOp, Lesson, PolicyState};
 
 /// What a rollout chose, and what it could have chosen at each step.
 ///

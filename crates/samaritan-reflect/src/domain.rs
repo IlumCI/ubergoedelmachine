@@ -88,6 +88,22 @@ impl<'a> SelfModDomain<'a> {
     }
 }
 
+/// The grammar's name for a mutation's kind.
+///
+/// Distinct from [`short`], which disambiguates *which* knob a threshold move
+/// touches for the policy code. The grammar switches whole kinds on and off, so
+/// every threshold move shares one name here.
+fn grammar_kind(m: &Mutation) -> &'static str {
+    match m {
+        Mutation::LessonAdd { .. } => "lesson_add",
+        Mutation::LessonRemove { .. } => "lesson_remove",
+        Mutation::LessonReweight { .. } => "lesson_reweight",
+        Mutation::ThresholdSet { .. } => "threshold_set",
+        Mutation::GrammarEdit { .. } => "grammar_edit",
+        Mutation::CodePatch { .. } => "code_patch",
+    }
+}
+
 fn short(m: &Mutation) -> String {
     match m {
         Mutation::LessonAdd { .. } => "lesson_add".into(),
@@ -104,12 +120,20 @@ impl Domain for SelfModDomain<'_> {
         // A candidate is legal until it has already been applied in this
         // rollout, which shows up as its effect already being present. Cheap
         // proxy: a lesson whose text is already a lesson in the state is spent.
+        //
+        // It must also be a kind the *grammar* currently admits. That clause is
+        // what makes level 2 real: a grammar edit above narrows or widens the
+        // vocabulary the level-1 search below is allowed to draw from, rather
+        // than the vocabulary being fixed in this function.
         self.order
             .iter()
             .filter(|code| {
                 let Some(cand) = self.candidates.get(*code) else {
                     return false;
                 };
+                if !state.grammar().kind_enabled(grammar_kind(&cand.mutation)) {
+                    return false;
+                }
                 match &cand.mutation {
                     Mutation::LessonAdd { text } => {
                         !state.lessons().iter().any(|l| &l.text == text)
@@ -121,8 +145,19 @@ impl Domain for SelfModDomain<'_> {
             .collect()
     }
 
-    fn instantiate(&mut self, code: &MutationCode, _state: &PolicyState) -> Option<Mutation> {
-        self.candidates.get(code).map(|c| c.mutation.clone())
+    fn instantiate(&mut self, code: &MutationCode, state: &PolicyState) -> Option<Mutation> {
+        let m = self.candidates.get(code)?.mutation.clone();
+        // The grammar owns the reweight step size, so a level-2 edit retunes how
+        // hard every level-1 reweight pushes. The mined sign is kept — mining
+        // decided the direction, the grammar decides the magnitude.
+        if let Mutation::LessonReweight { id, delta } = m {
+            let magnitude = state.grammar().reweight_delta();
+            return Some(Mutation::LessonReweight {
+                id,
+                delta: if delta < 0.0 { -magnitude } else { magnitude },
+            });
+        }
+        Some(m)
     }
 
     fn apply(&mut self, state: &mut PolicyState, m: &Mutation) -> bool {
@@ -168,4 +203,84 @@ pub fn search_mined<'a>(
         budget,
     );
     (score, trace.mutations)
+}
+
+#[cfg(test)]
+mod level_two_tests {
+    use super::*;
+    use samaritan_search::GrammarOp;
+
+    fn lesson_candidate(text: &str) -> Candidate {
+        Candidate {
+            mutation: Mutation::LessonAdd { text: text.into() },
+            rationale: "mined".into(),
+            support: 50,
+            effect: 0.5,
+        }
+    }
+
+    fn grammar_edit(op: GrammarOp) -> Mutation {
+        Mutation::GrammarEdit {
+            spec: serde_json::to_value(op).unwrap(),
+        }
+    }
+
+    fn domain_over(candidates: Vec<Candidate>) -> SelfModDomain<'static> {
+        SelfModDomain::new(candidates, Admission::new(2), 1, 4, |_| 0.0)
+    }
+
+    #[test]
+    fn the_grammar_gates_what_the_search_below_may_play() {
+        // The point of level 2, demonstrated: an edit made *above* changes the
+        // moves available *below*. With lesson_add disabled, a vocabulary made
+        // entirely of lesson_add candidates offers the level-1 search nothing.
+        let d = domain_over(vec![lesson_candidate("a"), lesson_candidate("b")]);
+
+        let open = PolicyState::default();
+        assert_eq!(d.legal(&open).len(), 2, "both moves are available by default");
+
+        let mut narrowed = PolicyState::default();
+        narrowed
+            .apply(
+                &grammar_edit(GrammarOp::DisableKind { kind: "lesson_add".into() }),
+                &Admission::new(2),
+            )
+            .expect("narrowing the grammar is legal");
+        assert!(
+            d.legal(&narrowed).is_empty(),
+            "a grammar edit above must remove the moves below"
+        );
+    }
+
+    #[test]
+    fn the_grammar_sets_the_reweight_magnitude() {
+        // The mined candidate carries a direction; the grammar carries the step.
+        let cand = Candidate {
+            mutation: Mutation::LessonReweight {
+                id: samaritan_dsl::LessonId(1),
+                delta: -0.1,
+            },
+            rationale: "mined".into(),
+            support: 30,
+            effect: 0.4,
+        };
+        let mut d = domain_over(vec![cand]);
+        let code = d.legal(&PolicyState::default())[0].clone();
+
+        let mut state = PolicyState::default();
+        state
+            .apply(
+                &grammar_edit(GrammarOp::SetReweightDelta { value: 2.0 }),
+                &Admission::new(2),
+            )
+            .unwrap();
+
+        match d.instantiate(&code, &state).expect("instantiates") {
+            Mutation::LessonReweight { delta, .. } => {
+                // Magnitude from the grammar, sign from the mining.
+                assert_eq!(delta, -2.0);
+            }
+            other => panic!("expected a reweight, got {other:?}"),
+        }
+    }
 }
