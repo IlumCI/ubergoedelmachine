@@ -1,12 +1,59 @@
-# Training the Deviant (QDoRA)
+# Training (QDoRA)
 
-The Deviant learns in two ways. In the arena it learns *explicitly* — a landed
-attack becomes a known exploit class and a failing test. This directory is its
-*implicit* channel: a QDoRA fine-tune on the attacks that landed, so the
-technique moves into the weights instead of being rediscovered every bout.
+`qdora_deviant.py` fine-tunes a model on a `{system, user, completion,
+verdict, reward}` JSONL. Two producers feed it, the same format both:
 
-It is a one-shot offline batch job. The harness stays Rust; nothing here runs in
-its hot loop.
+- **The Deviant** (`export_dataset`) — the attacks that landed, so a red-team
+  technique moves into the weights instead of being rediscovered every bout.
+- **Verified reasoning self-training** (`selftrain_export`) — the reasoning
+  traces the harness graded *correct*, so the model learns from its own working
+  that actually solved the problem (STaR/ReST). This is the feasible form of
+  "retrain the model" to lift it past the substrate ceiling on reasoning.
+
+Both are one-shot offline batch jobs. The harness stays Rust; nothing here runs
+in its hot loop.
+
+## Where it runs — the compute split
+
+A 4 GB laptop *serves* inference but cannot *train* even a 4B in QDoRA (that
+wants ~16 GB VRAM). So the work splits:
+
+- **Local (laptop):** generate traces, grade them, export the JSONL, re-eval.
+- **Cloud (the fine-tune only):** a **Kaggle free T4 (16 GB, ~30 GPU-h/week)**
+  is enough for QDoRA of a 4B and needs no payment. **Colab** works too; Colab
+  Pro (L4/A100) is worth buying only when you move to a bigger base (7-14B),
+  full fine-tuning, or long runs — not for a 4B QDoRA. Push the trained adapter
+  to HF or download it, convert to GGUF, and serve it locally.
+
+## Verified reasoning self-training (the reasoning loop)
+
+```
+serve.ps1 -Role solver                         # the base model, local
+selftrain_export (DATASET=<trainable set>)     # solve -> grade -> keep correct
+  -> reasoning-selftrain.jsonl                 # verified traces, trainer-ready
+qdora_deviant.py <that jsonl>   (on Kaggle/Colab GPU)  -> adapter
+  -> merge + convert to GGUF -> serve.ps1 -Role solver  # the improved base
+reason_eval (DATASET=<held-out p2>)            # did it move? measure honestly
+```
+
+1. **Generate + verify (local).** With the solver served:
+   ```powershell
+   $env:DATASET = "$env:USERPROFILE\models\reasoning\gsm-symbolic-main.jsonl"
+   cargo run -p samaritan-run --example selftrain_export   # writes reasoning-selftrain.jsonl
+   ```
+   Use an *easier* trainable split to generate from (GSM-Symbolic `main`/`p1`,
+   or GSM8K) so the solver actually lands some — you can only learn from what it
+   solved. Keep the hard `p2` set held-out for measuring.
+2. **Fine-tune (cloud GPU).** Upload `reasoning-selftrain.jsonl` (as a Kaggle
+   dataset, or push via HF) and run the trainer there:
+   ```bash
+   python qdora_deviant.py reasoning-selftrain.jsonl --base-model Qwen/Qwen3-4B-Thinking-2507
+   ```
+   (`--allow-small` for a first proof run; every row is verified-correct, so the
+   set is all positive signal.)
+3. **Convert + serve + measure.** Merge the adapter, convert to GGUF (see below),
+   point `serve.ps1 -Role solver` at it, and re-run `reason_eval` on held-out p2.
+   The number moving — or not — is the honest test of whether the loop works.
 
 ## Why Python / Unsloth
 
