@@ -709,6 +709,23 @@ fn grade_answer_is_conservative() {
 }
 
 #[test]
+fn grade_answer_compares_numbers_numerically() {
+    // The exact miss the first p2 eval exposed: "45" answers the key "45.0".
+    assert!(grade_answer("45.0", AnswerKind::ExactMatch, "45"));
+    assert!(grade_answer("45.0", AnswerKind::ExactMatch, "The answer is 45."));
+    // Units and LaTeX around the number don't matter; the number does.
+    assert!(grade_answer("35", AnswerKind::ExactMatch, r"\boxed{35\%}"));
+    assert!(grade_answer("20", AnswerKind::ExactMatch, "20%"));
+    assert!(grade_answer("1024", AnswerKind::ExactMatch, "1,024"));
+    // A genuinely different number is still wrong.
+    assert!(!grade_answer("37.5", AnswerKind::ExactMatch, "66%"));
+    assert!(!grade_answer("42.5", AnswerKind::ExactMatch, "65%"));
+    // A numeric key is judged only on the number — a text key still isn't:
+    // "yes"/"C" keep the token match, unaffected by the numeric path.
+    assert!(grade_answer("yes", AnswerKind::ExactMatch, "Yes, all of them."));
+}
+
+#[test]
 fn a_task_without_a_kind_field_deserializes_as_coding() {
     // Backward compatibility: every task mined or stored before the reasoning
     // surface existed carried no `kind`, and must still read as a coding task.

@@ -144,6 +144,17 @@ impl Default for TaskKind {
 /// an unusual phrasing rather than over-crediting a coincidence. W8 upgrades the
 /// reasoning path to an LLM judge; this is the deterministic floor.
 pub fn grade_answer(expected: &str, _kind: AnswerKind, given: &str) -> bool {
+    // A purely-numeric key is graded numerically: `45` answers `45.0`, and a
+    // model wrapping its number in `%`, `$`, `\boxed{}` or prose is judged on the
+    // number, not the formatting. This is the common math-answer case, and token
+    // matching gets it wrong — a decimal point becomes a space and `45.0` stops
+    // matching `45`.
+    if is_pure_number(expected) {
+        if let Some(target) = numbers_in(expected).first().copied() {
+            return numbers_in(given).iter().any(|n| numbers_close(*n, target));
+        }
+    }
+
     let exp = normalize_answer(expected);
     if exp.is_empty() {
         return false;
@@ -159,6 +170,45 @@ pub fn grade_answer(expected: &str, _kind: AnswerKind, given: &str) -> bool {
     } else {
         got_tokens.windows(exp_tokens.len()).any(|w| w == exp_tokens.as_slice())
     }
+}
+
+/// Whether the answer key is just a number (optionally with `%`, sign, commas) —
+/// the case to grade numerically. `"45.0"` and `"37.5%"` are; `"C"`, `"yes"`,
+/// `"Marie Curie"` are not.
+fn is_pure_number(s: &str) -> bool {
+    let t = s.trim();
+    !t.is_empty()
+        && numbers_in(t).len() == 1
+        && t.chars().all(|c| c.is_ascii_digit() || " .%,+-".contains(c))
+}
+
+/// Every number appearing in a string, with `%`, `$`, `\`, braces and commas
+/// treated as separators so `"\boxed{35\%}"` yields `35` and `"1,024"` yields
+/// `1024`.
+fn numbers_in(s: &str) -> Vec<f64> {
+    // Drop thousands separators first ("1,024" -> "1024"), then treat every
+    // other non-numeric char as a break between numbers.
+    let s = s.replace(',', "");
+    let cleaned: String = s
+        .chars()
+        .map(|c| if c.is_ascii_digit() || c == '.' || c == '-' { c } else { ' ' })
+        .collect();
+    let mut out = Vec::new();
+    for tok in cleaned.split_whitespace() {
+        // Trim stray leading/trailing dots or dashes ("42." / "-").
+        let tok = tok.trim_matches(|c| c == '.' || c == '-');
+        if tok.is_empty() {
+            continue;
+        }
+        if let Ok(n) = tok.parse::<f64>() {
+            out.push(n);
+        }
+    }
+    out
+}
+
+fn numbers_close(a: f64, b: f64) -> bool {
+    (a - b).abs() <= 1e-6 * a.abs().max(b.abs()).max(1.0)
 }
 
 fn normalize_answer(s: &str) -> String {
