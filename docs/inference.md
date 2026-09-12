@@ -179,3 +179,56 @@ recorded is no better than one that never is.
 .\scripts\tune-ngl.ps1        # measure the best split on this box
 .\scripts\serve.ps1 -Ngl 14   # use the number tune-ngl printed
 ```
+
+## Choosing the reasoning substrate
+
+Measured baseline (this box, RTX 3050 Laptop 4 GB, `llama-bench -ngl 18 -t 6`):
+
+| Huihui-Ministral-3-8B Q6_K | tok/s |
+|---|---|
+| prompt prefill (pp512) | 357 |
+| generation (tg128) | 7.94 |
+
+The budget is ~120 s per call. Prefill is cheap (~3 s for a 1 k-token prompt),
+so the whole budget is the generation: `~117 s × 7.94 ≈ 930 tokens`. That is the
+decisive fact — **the 8B can just about emit a 900-token *answer*, and has no
+room left for a *thinking trace*.** A reasoning-distilled model does not answer
+in 900 tokens; it thinks for one to three thousand first. At 7.94 t/s a
+2 000-token trace is 4.2 minutes — over double the budget.
+
+So the substrate that reasons well *and* fits the box must run **faster** than
+the current 8B, which on a 4 GB GPU means **fewer parameters or a heavier quant**
+(more layers resident on the GPU). Required generation speed:
+
+| tokens per answer (think + answer) | needed tok/s |
+|---|---|
+| 900 (terse) | ≥ 7.7 |
+| 1 500 (light thinking) | ≥ 12.8 |
+| 2 500 (real thinking) | ≥ 21 |
+
+**What to get.** A reasoning-distilled / native-thinking small model, **~3–4B**,
+on a **Qwen** base — the family every strong small-reasoning model is built on
+because Qwen bases are unusually strong at math/code per parameter.
+
+- **First choice — Qwen3-4B-Thinking (Alibaba Qwen).** ~4B, native thinking; at
+  Q5_K_M (~3 GB) most layers sit on the GPU → ~20–35 t/s → a real thinking trace
+  fits the budget.
+- **DeepSeek-R1-Distill-Qwen-1.5B (DeepSeek × Qwen).** Fastest (fits the GPU
+  outright), weakest — a good speed/floor reference.
+- **DeepSeek-R1-Distill-Qwen-7B / OpenThinker3-7B (Qwen base), at Q4_K_M.**
+  Strongest reasoning that still ~fits, but ~8–10 t/s — same "no thinking
+  headroom" problem as the 8B. Pick only if per-question time may exceed 2 min.
+
+Grab GGUFs from the usual quant providers (bartowski / unsloth / mradermacher),
+then **verify on the box before trusting it** — at the model's *real* thinking
+length, not the flattering 900:
+
+```powershell
+.\scripts\bench-model.ps1 -Model $env:USERPROFILE\models\<candidate>.gguf `
+    -Ngl 20,24,28 -ThinkTokens 2000
+```
+
+Note the two roles want different models: the **solver** wants a strong small
+Qwen reasoning model (no abliteration needed — solving math trips no refusals);
+the **adversary/Deviant** keeps the abliterated checkpoint, because its job is to
+attempt what a refusal-trained model would decline.
