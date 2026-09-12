@@ -36,12 +36,14 @@
 //! decoration, never as the source of truth.
 
 pub mod domain;
+pub mod grammar;
 pub mod observation;
 
 use samaritan_dsl::{Knob, Mutation};
 use serde::{Deserialize, Serialize};
 
 pub use domain::{SelfModDomain, search_mined};
+pub use grammar::{GrammarDomain, grammar_ops, search_grammar};
 pub use observation::{Corpus, Observation};
 
 /// A proposed self-modification, with the evidence that produced it.
