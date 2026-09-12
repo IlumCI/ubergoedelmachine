@@ -532,6 +532,29 @@ impl Ledger {
         Ok(v)
     }
 
+    /// Capabilities a human has currently unlocked.
+    ///
+    /// Replays the grant and revoke rows in order and returns what is unlocked
+    /// at the end — a grant followed by a revoke is not current. This is the
+    /// `human_unlocked` fact [`samaritan_kernel::may_activate`] needs, read from
+    /// the record rather than asserted by the agent.
+    pub fn granted_capabilities(&self) -> Result<Vec<samaritan_kernel::Capability>, LedgerError> {
+        use std::collections::BTreeSet;
+        let mut granted: BTreeSet<samaritan_kernel::Capability> = BTreeSet::new();
+        for e in self.entries()? {
+            match e.event {
+                Event::CapabilityGranted { capability, .. } => {
+                    granted.insert(capability);
+                }
+                Event::CapabilityRevoked { capability, .. } => {
+                    granted.remove(&capability);
+                }
+                _ => {}
+            }
+        }
+        Ok(granted.into_iter().collect())
+    }
+
     /// The measured evidence a milestone gate is judged against.
     ///
     /// Bridges the ledger's record to the kernel's pure [`Evidence`]. Every

@@ -559,3 +559,44 @@ fn a_clean_capable_record_becomes_repo_eligible_but_still_needs_a_human() {
     assert!(may_activate(Capability::PublicRepo, Mode::Real, &ev, false, true).is_err());
     assert!(may_activate(Capability::PublicRepo, Mode::Real, &ev, true, true).is_ok());
 }
+
+#[test]
+fn granted_capabilities_replays_grants_and_revokes() {
+    let mut l = mem();
+    assert!(l.granted_capabilities().unwrap().is_empty());
+
+    l.append(
+        Actor::Human,
+        &Event::CapabilityGranted {
+            capability: Capability::ReadOnlyInternet,
+            note: "demonstrated in simulation, record clean".into(),
+        },
+    )
+    .unwrap();
+    l.append(
+        Actor::Human,
+        &Event::CapabilityGranted {
+            capability: Capability::PublicRepo,
+            note: "milestone reached".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        l.granted_capabilities().unwrap(),
+        vec![Capability::ReadOnlyInternet, Capability::PublicRepo]
+    );
+
+    // Autonomy is lost at once: a revoke removes it from the current set.
+    l.append(
+        Actor::Human,
+        &Event::CapabilityRevoked {
+            capability: Capability::PublicRepo,
+            reason: "a real breach landed".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        l.granted_capabilities().unwrap(),
+        vec![Capability::ReadOnlyInternet]
+    );
+}

@@ -30,10 +30,13 @@
 
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 /// A thing the machine may be allowed to do, ordered by how far it reaches past
 /// the sandbox. Declaration order is the ordering: a later capability reaches
 /// further and its bar is strictly higher.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Capability {
     /// The floor: sandboxed local repo work under `--network none`. Always
     /// active; it needs nothing and unlocks nothing new.

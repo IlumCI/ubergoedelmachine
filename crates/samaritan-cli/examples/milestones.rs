@@ -23,11 +23,15 @@ fn main() {
         eprintln!("could not read evidence: {e}");
         std::process::exit(1);
     });
+    let granted = ledger.granted_capabilities().unwrap_or_else(|e| {
+        eprintln!("could not read grants: {e}");
+        std::process::exit(1);
+    });
 
     let style = if std::env::var_os("NO_COLOR").is_some() {
         Style::PLAIN
     } else {
         Style::COLOR
     };
-    print!("{}", milestones(&ev, 72, style));
+    print!("{}", milestones(&ev, &granted, 72, style));
 }

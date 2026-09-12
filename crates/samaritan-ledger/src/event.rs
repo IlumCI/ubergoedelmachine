@@ -13,7 +13,7 @@
 
 use samaritan_dsl::{Digest, Mutation, ProposedAction, Reversibility};
 use samaritan_dsl::decision::{BlastRadius, DecisionId, DecisionRecord};
-use samaritan_kernel::{EpisodeUtility, Refusal, Tier};
+use samaritan_kernel::{Capability, EpisodeUtility, Refusal, Tier};
 use serde::{Deserialize, Serialize};
 
 /// Who wrote a row.
@@ -220,6 +220,27 @@ pub enum Event {
     PromotionGranted { class_json: serde_json::Value },
     PromotionRevoked {
         class_json: serde_json::Value,
+        reason: String,
+    },
+
+    /// A human moved the ceiling: a capability the machine was *eligible* for is
+    /// now unlocked.
+    ///
+    /// This is the grant that eligibility is not. It is recorded only when a
+    /// human acts through the approval path — the agent cannot append it for
+    /// itself any more than it can approve its own action — so a
+    /// [`samaritan_kernel::Capability`] reaching `may_activate` with
+    /// `human_unlocked = true` can always be traced to one of these rows.
+    CapabilityGranted {
+        capability: Capability,
+        /// Why the human unlocked it, for the record a later reviewer reads.
+        note: String,
+    },
+
+    /// A human took a capability back. Autonomy is lost at once, so a revoke is
+    /// immediate and needs no eligibility.
+    CapabilityRevoked {
+        capability: Capability,
         reason: String,
     },
 

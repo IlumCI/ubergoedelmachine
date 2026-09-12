@@ -340,7 +340,7 @@ pub fn approval(req: &ApprovalRequest, width: usize, st: Style, selected: usize)
 /// a safety problem, not an aesthetic one. It shows, per capability, whether the
 /// bar is met and — when it is not — exactly what is missing, and it never
 /// offers to grant anything: eligibility is reported, the unlock is the human's.
-pub fn milestones(ev: &Evidence, width: usize, st: Style) -> String {
+pub fn milestones(ev: &Evidence, granted: &[Capability], width: usize, st: Style) -> String {
     let width = width.clamp(48, 100);
     let inner = width - 4;
     let mut out = String::new();
@@ -371,10 +371,17 @@ pub fn milestones(ev: &Evidence, width: usize, st: Style) -> String {
     for cap in Capability::ALL {
         let e = eligibility(cap, ev);
         let needs_human = cap.requirements().requires_human_unlock;
+        let is_granted = granted.contains(&cap);
         let (glyph, status) = if e.is_eligible() && !needs_human {
             (st.green("●"), st.green("active"))
+        } else if e.is_eligible() && is_granted {
+            (st.green("●"), st.green("granted — active"))
         } else if e.is_eligible() {
             (st.green("✓"), st.green("eligible — awaiting human unlock"))
+        } else if is_granted {
+            // A human unlocked it, but the record has since fallen below the
+            // bar. The grant stands; the honest thing is to flag the slip.
+            (st.yellow("!"), st.yellow("granted, but no longer meets the bar"))
         } else {
             (st.red("✗"), st.red("locked"))
         };
@@ -406,7 +413,7 @@ mod milestone_tests {
 
     #[test]
     fn a_fresh_system_shows_the_floor_active_and_the_rest_locked() {
-        let out = milestones(&Evidence::none(), 72, Style::PLAIN);
+        let out = milestones(&Evidence::none(), &[], 72, Style::PLAIN);
         assert!(out.contains("capability milestones"));
         // The floor is active with no human needed.
         assert!(out.contains("local sandbox  active"));
@@ -424,10 +431,37 @@ mod milestone_tests {
             brier: 0.05,
             certified_selfmods: 4,
         };
-        let out = milestones(&ev, 72, Style::PLAIN);
+        let out = milestones(&ev, &[], 72, Style::PLAIN);
         assert!(out.contains("public repo  eligible — awaiting human unlock"));
         // The panel must never imply a self-grant.
         assert!(out.contains("a human moves the ceiling"));
         assert!(!out.to_lowercase().contains("granted automatically"));
+    }
+
+    #[test]
+    fn a_granted_eligible_capability_reads_active() {
+        let ev = Evidence {
+            hle_score: 0.12,
+            clean_generations: 30,
+            brier: 0.05,
+            certified_selfmods: 4,
+        };
+        let out = milestones(&ev, &[Capability::PublicRepo], 72, Style::PLAIN);
+        assert!(out.contains("public repo  granted — active"));
+    }
+
+    #[test]
+    fn a_grant_that_fell_below_the_bar_is_flagged_not_hidden() {
+        // A human unlocked the repo, but calibration then decayed. The grant
+        // stands; the panel must say it no longer meets the bar rather than
+        // quietly showing it active.
+        let ev = Evidence {
+            hle_score: 0.12,
+            clean_generations: 30,
+            brier: 0.9, // calibration slipped
+            certified_selfmods: 4,
+        };
+        let out = milestones(&ev, &[Capability::PublicRepo], 72, Style::PLAIN);
+        assert!(out.contains("granted, but no longer meets the bar"));
     }
 }
