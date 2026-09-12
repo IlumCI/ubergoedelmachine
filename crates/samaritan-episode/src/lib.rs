@@ -47,6 +47,9 @@ pub enum EpisodeError {
 
     #[error("executor: {0}")]
     Exec(String),
+
+    #[error("agent: {0}")]
+    Agent(String),
 }
 
 /// Produces decisions. A trait so the episode loop can be tested against
@@ -316,6 +319,97 @@ pub trait ReasoningSolver {
     fn solve(&self, question: &str, lessons: &[String]) -> Result<ReasoningAnswer, EpisodeError>;
 }
 
+/// Instructions for the live solver.
+///
+/// It asks for a thinking pass, then a machine-findable final answer and a
+/// stated confidence — the confidence is not decoration, it is what the episode
+/// records for calibration, and the prompt says plainly that a confident wrong
+/// answer is worse than an honest hedge (HLE rewards exactly that).
+pub const REASONING_SYSTEM: &str = "\
+You are answering a single hard exam question. Reason carefully. Then end your \
+reply with two lines, exactly:\n\
+Answer: <your final answer, as short as the question allows>\n\
+Confidence: <a number from 0 to 1>\n\
+State a low confidence when unsure. A confident wrong answer is worse than an \
+honest low-confidence one.";
+
+/// The live solver: the local model, through [`samaritan_agent::Agent`].
+///
+/// The reasoning counterpart of `impl Decider for Agent`. It runs one
+/// completion, lets the model think, and lifts the final answer and confidence
+/// out of the reply — tolerant of a `<think>...</think>` block (Qwen3-Thinking
+/// and friends emit one) and of the prose a chat model wraps around its answer.
+/// It never grades itself; grading is [`Task::grade`]'s, in the episode.
+impl ReasoningSolver for samaritan_agent::Agent {
+    fn solve(&self, question: &str, lessons: &[String]) -> Result<ReasoningAnswer, EpisodeError> {
+        let user = if lessons.is_empty() {
+            question.to_string()
+        } else {
+            format!("{}\n\nKeep in mind:\n- {}", question, lessons.join("\n- "))
+        };
+        let cfg = self.config();
+        let (content, usage) = self
+            .complete(REASONING_SYSTEM, &user, None, None, cfg.temperature, cfg.seed.unwrap_or(0))
+            .map_err(|e| EpisodeError::Agent(e.to_string()))?;
+        let (answer, confidence) = extract_answer(&content);
+        Ok(ReasoningAnswer { answer, confidence, tokens: usage.total() })
+    }
+}
+
+/// Lift the final answer and stated confidence out of a reasoning reply.
+///
+/// Drops a thinking block, prefers an explicit `Answer:` marker, and falls back
+/// to the last non-empty line — because a model that ignores the format still
+/// usually puts its answer last. Confidence defaults to 0.5 (an honest "unsure")
+/// when unstated, never to a flattering high value.
+pub fn extract_answer(content: &str) -> (String, f64) {
+    // Everything after the last </think> is the answer proper; if there is no
+    // think block, the whole reply is.
+    let body = match content.rfind("</think>") {
+        Some(i) => &content[i + "</think>".len()..],
+        None => content,
+    };
+    let confidence = parse_confidence(body).unwrap_or(0.5);
+    let answer = marker_value(body, "answer:")
+        .or_else(|| marker_value(body, "final answer:"))
+        .unwrap_or_else(|| last_nonempty_line(body))
+        .trim()
+        .to_string();
+    (answer, confidence)
+}
+
+/// The text after a case-insensitive `marker` on the last line that carries it.
+fn marker_value(text: &str, marker: &str) -> Option<String> {
+    let mut found = None;
+    for line in text.lines() {
+        let lower = line.to_lowercase();
+        if let Some(pos) = lower.find(marker) {
+            // Take from the original line so the answer's own casing survives.
+            found = Some(line[pos + marker.len()..].trim().to_string());
+        }
+    }
+    found.filter(|s| !s.is_empty())
+}
+
+fn parse_confidence(text: &str) -> Option<f64> {
+    let v = marker_value(text, "confidence:")?;
+    // The value may be "0.8", "0.8 (high)", "80%"; take the leading number.
+    let token: String = v.trim().chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+    let n: f64 = token.parse().ok()?;
+    // A percentage if it came in as 0-100.
+    let n = if n > 1.0 { n / 100.0 } else { n };
+    Some(n.clamp(0.0, 1.0))
+}
+
+fn last_nonempty_line(text: &str) -> String {
+    text.lines()
+        .rev()
+        .map(|l| l.trim())
+        .find(|l| !l.is_empty())
+        .unwrap_or("")
+        .to_string()
+}
+
 /// Run one reasoning task to a score.
 ///
 /// The parallel of [`run_episode`] for the reasoning surface: no worktree, no
@@ -510,6 +604,36 @@ mod reasoning_tests {
         let out = run_reasoning_episode(&task(), &Broken, &mut l, &EpisodeConfig::default()).unwrap();
         assert!(matches!(out.ending, Ending::AgentFailed { .. }));
         assert_eq!(out.components.task_success, 0.0);
+    }
+
+    #[test]
+    fn extract_answer_lifts_the_final_answer_past_the_thinking() {
+        let reply = "<think>6*7 is 42, let me double check... yes 42.</think>\n\
+                     Answer: 42\nConfidence: 0.9";
+        let (a, c) = extract_answer(reply);
+        assert_eq!(a, "42");
+        assert!((c - 0.9).abs() < 1e-9);
+    }
+
+    #[test]
+    fn extract_answer_defaults_confidence_and_falls_back_to_the_last_line() {
+        // No markers at all: take the last non-empty line, hedge the confidence.
+        let (a, c) = extract_answer("<think>...</think>\nThe capital is Paris");
+        assert_eq!(a, "The capital is Paris");
+        assert!((c - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn extract_answer_handles_a_percentage_confidence_and_no_think_block() {
+        let (a, c) = extract_answer("Answer: C\nConfidence: 80%");
+        assert_eq!(a, "C");
+        assert!((c - 0.8).abs() < 1e-9);
+    }
+
+    #[test]
+    fn extract_answer_preserves_answer_casing() {
+        let (a, _) = extract_answer("answer: Marie Curie\nconfidence: 0.7");
+        assert_eq!(a, "Marie Curie");
     }
 
     #[test]

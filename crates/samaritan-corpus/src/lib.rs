@@ -22,12 +22,14 @@
 
 pub mod git;
 pub mod mine;
+pub mod reasoning;
 pub mod sandbox;
 pub mod screen;
 
 use serde::{Deserialize, Serialize};
 
 pub use mine::{MineOptions, mine};
+pub use reasoning::load_reasoning;
 pub use sandbox::{Sandbox, materialize};
 pub use screen::{OracleOutcome, OracleRunner, ScreenReport, screen_for_flakes};
 
