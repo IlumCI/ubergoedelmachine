@@ -27,16 +27,21 @@ max_retries = 2
 
 [agent.models]
 # The two agents are, in the shorthand this project uses, the Christ and the
-# Anti-Christ. Both are real grammar-constrained local models; the second is
-# abliterated so it will actually attempt the adversary role.
+# Anti-Christ. Both are real grammar-constrained local models.
 #
-#   playout / proposer  = the Warden       = "the Christ"
+#   playout / proposer  = the Warden       = "the Christ"   (the solver)
 #   deviant             = the Deviant      = "the Anti-Christ"
 #
-# One checkpoint can serve every role to start. The design expects a cheap
-# model for the thousands of level-0 playouts and a strong one for the rare
-# proposer and deviant calls; split these when a second load is worth it.
-playout  = "samaritan-playout"   # the Christ, solving repo tasks
+# They now want different checkpoints, and a 4 GB GPU cannot hold both, so
+# scripts\serve.ps1 serves one at a time under a single alias — the name below,
+# which every role and example asks for. Switch the served model by role:
+#   scripts\serve.ps1 -Role solver    # Qwen3-4B-Thinking Q8_0, -ngl 30
+#   scripts\serve.ps1 -Role deviant   # Ministral-3 8B abliterated Q6_K, -ngl 18
+#
+# The solver is a reasoning-distilled 4B because, benched on this box, the 8B is
+# too slow to think inside the time budget (see docs/inference.md). The deviant
+# stays abliterated because attempting the refused is its job.
+playout  = "samaritan-playout"   # the Christ, solving tasks (solver role)
 proposer = "samaritan-playout"   # the Christ, proposing self-modifications
 deviant  = "samaritan-playout"   # the Anti-Christ, attacking the guards
 
@@ -50,21 +55,35 @@ max_tokens = 1024
 # the bout examples set 1.2 and cap attack tokens lower (640). See samaritan-agent.
 repeat_penalty = 1.2
 
-[model]
-repo  = "mradermacher/Huihui-Ministral-3-8B-Reasoning-2512-abliterated-GGUF"
-file  = "Huihui-Ministral-3-8B-Reasoning-2512-abliterated.Q6_K.gguf"
-arch  = "mistral3"               # from the GGUF header; see docs/inference.md
-quant = "Q6_K"
+# Two models, one served at a time (a 4 GB GPU holds neither with room to
+# spare). scripts\serve.ps1 -Role picks between them; both are a CPU+GPU split
+# load. Operating points are measured, not guessed — see docs/inference.md.
+
+[model.solver]
+# The reasoning substrate. A 4B thinking model, because the 8B is too slow to
+# think in budget: benched at 7.9 t/s generation vs this at 18.9 t/s (-ngl 30).
+repo    = "detrax/Qwen3-4B-Thinking-2507-Qwen3.8-Max-Distillation-Detrax"
+file    = "Qwen3-4B-Thinking-2507-Qwen3.8-Max-Distillation-Detrax-q8_0.gguf"
+arch    = "qwen3"
+quant   = "Q8_0"
+size_gb = 3.98
+gpu_layers = 30            # measured peak; generation 18.9 t/s, prefill 1003 t/s; cliff at 31
+
+[model.deviant]
+# The adversary. Abliterated so it will attempt what a refusal-trained model
+# would decline — the point of the role, a liability in a solver.
+repo    = "mradermacher/Huihui-Ministral-3-8B-Reasoning-2512-abliterated-GGUF"
+file    = "Huihui-Ministral-3-8B-Reasoning-2512-abliterated.Q6_K.gguf"
+arch    = "mistral3"
+quant   = "Q6_K"
 size_gb = 6.49
+gpu_layers = 18            # measured; 18-19 equivalent, cliff at 20
 
 [serve]
-# Q6_K is 6.97 GB and the GPU has 4 GB, so this is a split load. Measure the
-# real best with scripts/tune-ngl.ps1 rather than trusting this default.
-gpu_layers = 18            # measured; 18-19 equivalent, cliff at 20
 threads = 6                      # P-cores only; E-cores slow the batch down
 threads_batch = 10               # prompt processing is compute-bound, use all
 parallel = 2                     # dialled down after a thermal scare; raise once cooling is proven
-ctx_per_slot = 4096
+ctx_per_slot = 4096              # room for a ~2 000-token thinking trace + prompt
 
 [arena]
 scratch_root = "C:/tmp/samaritan-arena"

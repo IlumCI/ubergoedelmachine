@@ -1,24 +1,45 @@
 <#
 .SYNOPSIS
-  Serve Huihui-Ministral-3-8B-Reasoning-2512-abliterated Q6_K for Samaritan.
+  Serve Samaritan's local model — the reasoning solver by default, or the
+  adversary on demand.
 
 .DESCRIPTION
+  Two roles want two different models, and a 4 GB GPU cannot hold both at once,
+  so this serves one at a time under a single alias (`samaritan-playout`) — the
+  name the Rust config and the examples ask for, so nothing there has to change
+  when you switch roles.
+
+      -Role solver   (default)  Qwen3-4B-Thinking-2507 Q8_0, -ngl 30
+      -Role deviant             Huihui-Ministral-3-8B abliterated Q6_K, -ngl 18
+
+  Why the solver is a 4B thinking model, not the 8B: benched on this box
+  (see docs/inference.md), the 8B generates at 7.9 t/s — the whole ~2-min budget
+  buys one 900-token answer with no room to *think*. The Qwen 4B at -ngl 30 does
+  18.9 t/s (2.4x) with 1003 t/s prefill, so a full ~2 000-token reasoning trace
+  fits the budget. Reasoning needs a model fast enough to reason out loud.
+
+  Why the adversary stays the abliterated Ministral: its job is to attempt what
+  a refusal-trained model would decline, so refusal ablation is the point there
+  and a liability in a solver.
+
   Tuned for this machine specifically:
 
       i7-12650H   6 P-cores + 4 E-cores, 16 threads
       16 GB       DDR4-3200, dual channel (~38 GB/s real)
       RTX 3050    Laptop, 4 GB VRAM (~3.5 GB usable), ~192 GB/s
 
-  Q6_K is 6.97 GB and does not fit in 4 GB, so this is a split load: as many
-  layers as fit go to the GPU, the rest run on CPU out of system RAM.
+  Both models are a split load: as many layers as fit go to the GPU, the rest
+  run on CPU out of system RAM.
 
   Why each setting is what it is:
 
   -ngl        Partial offload. GPU memory is ~5x faster per byte than system
               RAM here, so every layer moved across is a real win — but only
               until VRAM runs out, after which llama.cpp spills and it gets
-              worse, not better. The right number is measured, not guessed:
-              run tune-ngl.ps1 and put the winner here.
+              *worse*, not better. For the Qwen 4B the measured cliff is sharp:
+              generation climbs to 18.9 t/s at -ngl 30, then prefill collapses
+              1003 -> 215 t/s at 31. Do not exceed the role's default without
+              re-running bench-model.ps1.
 
   -t 6        Threads for generation: P-cores only. Alder Lake is
               heterogeneous and llama.cpp splits work evenly across threads,
@@ -28,14 +49,11 @@
   -tb 10      Threads for prompt processing. That phase is compute-bound
               rather than latency-bound, so the E-cores do help there.
 
-  --parallel 4 -cb
-              The largest single throughput lever on this box. Generation is
-              memory-bandwidth-bound: the weights are read once per token,
-              whether that token belongs to one sequence or four. Batching
-              four playouts amortises the read across all of them, so
-              aggregate tokens/sec goes up roughly 2-2.5x even though each
-              individual response is no faster. NRPA playouts are
-              embarrassingly parallel, which is exactly the shape this wants.
+  --parallel 2 -cb
+              Generation is memory-bandwidth-bound: the weights are read once
+              per token whether it belongs to one sequence or several, so
+              batching amortises the read and aggregate tokens/sec rises.
+              Dialled to 2 after a thermal scare; raise once cooling is proven.
 
   --cache-reuse 256
               Keeps the KV state of a matching prompt prefix. Samaritan lays
@@ -46,28 +64,45 @@
               Flash attention plus an 8-bit KV cache. Both cut memory traffic,
               which is the binding constraint.
 
-  (no mmap flag)
-              Upstream removed --no-mmap; loading behaviour is automatic now.
-              Verified against `llama-server --help` for build b10907 rather
-              than assumed, after the first launch died on the flag.
+.PARAMETER Role
+  solver (default) or deviant. Picks the model and its measured -ngl.
 
 .PARAMETER Ngl
-  GPU layers to offload. Default 14; run tune-ngl.ps1 to find the real best.
+  Override the role's default GPU-layer split. 0 (default) uses the measured
+  best for the role.
 #>
 param(
-    [int]$Ngl = 18,
+    [ValidateSet("solver", "deviant")][string]$Role = "solver",
+    [int]$Ngl = 0,
     [int]$Port = 8080,
     [string]$ModelDir = "$env:USERPROFILE\models",
-    [int]$Parallel = 2,   # dialled down after a thermal scare; raise once cooling is proven
+    [int]$Parallel = 2,
     [int]$CtxPerSlot = 4096
 )
 
 $ErrorActionPreference = "Stop"
-$model = Join-Path $ModelDir "Huihui-Ministral-3-8B-Reasoning-2512-abliterated.Q6_K.gguf"
 
+# Model and measured operating point per role. One at a time — the 4 GB GPU
+# cannot hold both.
+if ($Role -eq "solver") {
+    $modelFile = "Qwen3-4B-Thinking-2507-Qwen3.8-Max-Distillation-Detrax-q8_0.gguf"
+    $defaultNgl = 30
+    $label = "Qwen3-4B-Thinking Q8_0 (solver)"
+} else {
+    $modelFile = "Huihui-Ministral-3-8B-Reasoning-2512-abliterated.Q6_K.gguf"
+    $defaultNgl = 18
+    $label = "Ministral-3 8B Q6_K abliterated (deviant)"
+}
+if ($Ngl -le 0) { $Ngl = $defaultNgl }
+
+$model = Join-Path $ModelDir $modelFile
 if (-not (Test-Path $model)) {
     Write-Host "Model not found at $model" -ForegroundColor Yellow
-    Write-Host "Run scripts\fetch-model.ps1 first." -ForegroundColor Yellow
+    if ($Role -eq "solver") {
+        Write-Host "Fetch the Qwen3-4B-Thinking Q8_0 GGUF into $ModelDir first." -ForegroundColor Yellow
+    } else {
+        Write-Host "Run scripts\fetch-model.ps1 first." -ForegroundColor Yellow
+    }
     exit 1
 }
 
@@ -82,7 +117,7 @@ if (-not $server) {
 # Total context is shared across slots, so ask for per-slot x slots.
 $ctx = $CtxPerSlot * $Parallel
 
-Write-Host "Ministral-3 8B Q6_K  |  ngl=$Ngl  parallel=$Parallel  ctx=$ctx ($CtxPerSlot/slot)" -ForegroundColor Cyan
+Write-Host "$label  |  ngl=$Ngl  parallel=$Parallel  ctx=$ctx ($CtxPerSlot/slot)" -ForegroundColor Cyan
 
 & llama-server `
     --model $model `

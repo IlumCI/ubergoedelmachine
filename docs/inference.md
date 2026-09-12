@@ -232,3 +232,30 @@ Note the two roles want different models: the **solver** wants a strong small
 Qwen reasoning model (no abliteration needed — solving math trips no refusals);
 the **adversary/Deviant** keeps the abliterated checkpoint, because its job is to
 attempt what a refusal-trained model would decline.
+
+### Adopted: Qwen3-4B-Thinking Q8_0 at -ngl 30
+
+Benched and wired in (`serve.ps1 -Role solver`). The model is
+`detrax/Qwen3-4B-Thinking-2507-Qwen3.8-Max-Distillation-Detrax` (q8_0, 3.98 GB) —
+a Qwen3-4B-Thinking base further distilled from Qwen3.8-Max. The `-ngl` curve on
+this box is not monotone; it climbs, then falls off a sharp VRAM-spill cliff:
+
+| -ngl | prefill t/s | generation t/s |
+|---|---|---|
+| 24 | 1016 | 13.6 |
+| 26 | 1091 | 14.9 |
+| 28 | 1187 | 16.7 |
+| **30** | **1003** | **18.9** ← peak |
+| 31 | 215 (cliff) | 19.7 |
+| 32 | 184 | 12.8 |
+
+Generation keeps rising to 30; at 31 the prompt-processing collapses (the spill
+hits prefill first) for a 4 % generation gain not worth taking. **-ngl 30** is
+the operating point: 18.9 t/s generation (2.4× the 8B's 7.9), 1003 t/s prefill
+(2.8×). A ~1 k-token prompt prefills in ~1 s, and a full ~2 000-token thinking
+trace generates in ~106 s — inside the 2-minute budget the 8B could not meet.
+Do not exceed 30 without re-running `bench-model.ps1`.
+
+This measures **speed**, which is what makes the model *usable* as the substrate.
+Whether it reasons *better* — a higher held-out/HLE score — is the W8 evaluation,
+still to wire.
