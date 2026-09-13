@@ -390,14 +390,39 @@ impl Agent {
         }
 
         let url = format!("{}/chat/completions", self.cfg.base_url.trim_end_matches('/'));
-        let mut req = self.http.post(&url).header("Content-Type", "application/json");
-        if !self.cfg.api_key.is_empty() {
-            req = req.header("Authorization", &format!("Bearer {}", self.cfg.api_key));
-        }
 
-        let mut resp = match req.send_json(&body) {
-            Ok(r) => r,
-            Err(e) => return Err(AgentError::Transport(e.to_string())),
+        // Retry a *transient* failure — a 529/503 from a busy tunnel or a model
+        // still warming, a reset or timed-out connection — with exponential
+        // backoff. A non-transient status (400/404 bad request, 401/403 auth) is
+        // the server refusing a request it understood, so it fails fast: retrying
+        // only repeats it. This is why the reasoning path was losing items to a
+        // flaky endpoint while every good response came back fine.
+        let mut resp = {
+            let mut attempt = 0u32;
+            loop {
+                attempt += 1;
+                let mut req = self.http.post(&url).header("Content-Type", "application/json");
+                if !self.cfg.api_key.is_empty() {
+                    req = req.header("Authorization", &format!("Bearer {}", self.cfg.api_key));
+                }
+                match req.send_json(&body) {
+                    Ok(r) => {
+                        if is_transient_status(r.status().as_u16()) && attempt < MAX_HTTP_ATTEMPTS {
+                            std::thread::sleep(retry_backoff(attempt));
+                            continue;
+                        }
+                        break r;
+                    }
+                    Err(e) => {
+                        // A transport error (reset, timeout) is transient too.
+                        if attempt < MAX_HTTP_ATTEMPTS {
+                            std::thread::sleep(retry_backoff(attempt));
+                            continue;
+                        }
+                        return Err(AgentError::Transport(e.to_string()));
+                    }
+                }
+            }
         };
 
         let status = resp.status().as_u16();
@@ -432,6 +457,23 @@ impl Agent {
 
         Ok((content, usage))
     }
+}
+
+/// Max attempts for one completion when the failure looks transient (overload,
+/// gateway, reset). Enough to ride out a burst of 529s from a busy tunnel or a
+/// model still loading, without stalling a run for minutes.
+const MAX_HTTP_ATTEMPTS: u32 = 5;
+
+/// Transient HTTP statuses worth retrying: overload, rate-limit, gateway, timeout.
+/// Everything else the server understood and refused, so it should not be retried.
+fn is_transient_status(status: u16) -> bool {
+    matches!(status, 408 | 429 | 500 | 502 | 503 | 504 | 522 | 524 | 529)
+}
+
+/// Exponential backoff before retry `attempt` (1-based): 0.5s, 1s, 2s, 4s, 8s cap.
+fn retry_backoff(attempt: u32) -> std::time::Duration {
+    let secs = 0.5_f64 * 2_f64.powi((attempt.saturating_sub(1)) as i32);
+    std::time::Duration::from_millis((secs.min(8.0) * 1000.0) as u64)
 }
 
 /// Pull the JSON object out of a possibly-wrapped reply. Public so other
