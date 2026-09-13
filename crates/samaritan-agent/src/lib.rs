@@ -396,6 +396,18 @@ impl Agent {
             });
         }
 
+        // Rein in an over-thinking model. Qwen3.8 defaults to very high reasoning
+        // effort and will brute-force a hard problem until it runs out of space,
+        // never emitting a final answer. REASONING_EFFORT=low|medium lets the
+        // server cap that. Sent both the OpenAI-style field and Ollama's `think`
+        // level; a server that implements neither ignores them.
+        if let Ok(eff) = std::env::var("REASONING_EFFORT") {
+            if !eff.trim().is_empty() {
+                body["reasoning_effort"] = serde_json::Value::String(eff.clone());
+                body["think"] = serde_json::Value::String(eff);
+            }
+        }
+
         let url = format!("{}/chat/completions", self.cfg.base_url.trim_end_matches('/'));
 
         // Retry a *transient* failure — a 529/503 from a busy tunnel or a model

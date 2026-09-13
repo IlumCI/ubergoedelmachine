@@ -340,12 +340,16 @@ pub trait ReasoningSolver {
 /// records for calibration, and the prompt says plainly that a confident wrong
 /// answer is worse than an honest hedge (HLE rewards exactly that).
 pub const REASONING_SYSTEM: &str = "\
-You are answering a single hard exam question. Reason carefully. Then end your \
-reply with two lines, exactly:\n\
+You are answering a single hard exam question. Reason carefully but be EFFICIENT: \
+do not re-derive or re-verify the same result over and over, and do not pad your \
+working. Your output space is limited — if your reasoning is running long, stop \
+and commit to your best answer instead of continuing to deliberate, and always \
+leave room to finish. End your reply with two lines, exactly:\n\
 Answer: <your final answer, as short as the question allows>\n\
 Confidence: <a number from 0 to 1>\n\
 State a low confidence when unsure. A confident wrong answer is worse than an \
-honest low-confidence one.";
+honest low-confidence one — but running out of space with no answer is worst of \
+all, so always give the two closing lines.";
 
 /// There is no 100 % confidence. 0.95 is the ceiling: it is the highest a
 /// calibrated answer may claim, and the most any answer records. A confidence
