@@ -171,6 +171,83 @@ pub fn tally(questions: &[HleQuestion], answers: &[String]) -> HleResult {
     }
 }
 
+/// Tally from per-item verdicts (an LLM judge's, say), positionally aligned with
+/// the questions — the counterpart of [`tally`] when grading is not the built-in
+/// normalised match.
+pub fn tally_verdicts(verdicts: &[bool]) -> HleResult {
+    HleResult {
+        total: verdicts.len() as u32,
+        correct: verdicts.iter().filter(|&&v| v).count() as u32,
+    }
+}
+
+/// How answers were graded — printed alongside the score so a judge-graded
+/// number is never mistaken for a normalised-match one (they are not comparable).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GradeMethod {
+    /// Normalised string/token match — the deterministic floor ([`grade`]). Cheap
+    /// and reproducible, but under-credits a correct answer phrased unusually.
+    NormalizedMatch,
+    /// An LLM judge decided answer-equivalence against the gold answer — what real
+    /// HLE does, at one model call per item.
+    LlmJudge,
+}
+
+impl std::fmt::Display for GradeMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            GradeMethod::NormalizedMatch => "normalized-match",
+            GradeMethod::LlmJudge => "llm-judge",
+        })
+    }
+}
+
+/// The `(system, user)` prompt for an LLM judge deciding whether `given` answers
+/// `question` correctly, against the gold answer.
+///
+/// The judge is *shown the gold answer* and asked only to check equivalence — it
+/// does not solve the problem. That keeps the harness-owns-the-oracle discipline
+/// intact: the solver never sees the gold answer, and the judge is not the solver
+/// certifying its own success — it compares a candidate against ground truth the
+/// harness holds. Real HLE grades this way; the normalised [`grade`] is the
+/// deterministic floor for when no judge is available.
+pub fn judge_prompt(question: &HleQuestion, given: &str) -> (String, String) {
+    let system = "You are a strict grading judge. You are shown a question, the \
+        correct answer, and a candidate response. Decide only whether the \
+        candidate's FINAL answer means the same as the correct answer — ignore \
+        phrasing, order, formatting, symbols vs words, and any working shown. Do \
+        NOT solve the question yourself, and do not be swayed by confident \
+        wording. Reply with exactly one word: yes or no."
+        .to_string();
+    let user = format!(
+        "Question:\n{}\n\nCorrect answer:\n{}\n\nCandidate response:\n{}\n\n\
+         Does the candidate's final answer match the correct answer? Answer yes or no.",
+        question.question, question.answer, given
+    );
+    (system, user)
+}
+
+/// Parse a judge reply into a verdict: the last standalone `yes`/`no` token after
+/// any `</think>` block (the judge's final word). `None` when the reply states
+/// neither — the caller should fall back to the deterministic [`grade`] rather
+/// than guess.
+pub fn parse_verdict(reply: &str) -> Option<bool> {
+    let body = match reply.rfind("</think>") {
+        Some(i) => &reply[i + "</think>".len()..],
+        None => reply,
+    };
+    let mut verdict = None;
+    for tok in body.to_lowercase().split(|c: char| !c.is_alphanumeric()) {
+        match tok {
+            "yes" => verdict = Some(true),
+            "no" => verdict = Some(false),
+            _ => {}
+        }
+    }
+    verdict
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,5 +336,34 @@ mod tests {
     #[test]
     fn score_is_zero_over_an_empty_set() {
         assert_eq!(HleResult { total: 0, correct: 0 }.score(), 0.0);
+    }
+
+    #[test]
+    fn parse_verdict_takes_the_final_yes_no_past_thinking() {
+        assert_eq!(parse_verdict("<think>gold 42, candidate 42</think>\nyes"), Some(true));
+        assert_eq!(parse_verdict("No, the candidate said 43."), Some(false));
+        assert_eq!(parse_verdict("YES."), Some(true));
+        // The final word is the verdict, even after musing.
+        assert_eq!(parse_verdict("could be yes, but on reflection no"), Some(false));
+        // "yesterday" is not "yes"; neither word present -> undecided.
+        assert_eq!(parse_verdict("yesterday it rained"), None);
+        assert_eq!(parse_verdict("I cannot tell"), None);
+    }
+
+    #[test]
+    fn judge_prompt_shows_gold_and_candidate_and_asks_only_to_match() {
+        let question = q("42", AnswerType::ExactMatch);
+        let (system, user) = judge_prompt(&question, "the answer is forty-two");
+        assert!(system.to_lowercase().contains("yes or no"));
+        assert!(system.to_lowercase().contains("do not solve"));
+        assert!(user.contains("42")); // gold shown to the judge
+        assert!(user.contains("forty-two")); // candidate shown to the judge
+    }
+
+    #[test]
+    fn tally_verdicts_counts_trues() {
+        let r = tally_verdicts(&[true, false, true, true]);
+        assert_eq!(r.total, 4);
+        assert_eq!(r.correct, 3);
     }
 }
