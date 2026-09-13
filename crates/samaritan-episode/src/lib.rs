@@ -351,6 +351,27 @@ State a low confidence when unsure. A confident wrong answer is worse than an \
 honest low-confidence one — but running out of space with no answer is worst of \
 all, so always give the two closing lines.";
 
+/// Instructions for the tool-using solver: the same closing discipline as
+/// [`REASONING_SYSTEM`], plus a Python tool. The model reasons, and when it needs
+/// to compute — arithmetic, algebra, enumeration, or *checking* a candidate — it
+/// emits a fenced ```python block and stops; the harness runs it and feeds the
+/// exact output back. This kills the careless-computation error class a fixed base
+/// makes most often, and lets it verify an answer before committing.
+pub const TOOL_LOOP_SYSTEM: &str = "\
+You are answering a single hard exam question, and you have a Python tool.\n\
+To run code, output a fenced ```python code block and then STOP writing — you will \
+be shown the exact stdout/stderr, then you continue. Use the tool for anything \
+mechanical: arithmetic, algebra, enumeration, simulation, and above all to CHECK \
+your answer before committing it — do not do heavy computation in your head, that \
+is where careless mistakes happen. You may use the tool several times. Reason \
+carefully but be EFFICIENT: do not re-derive the same result over and over. When \
+you are sure, end your reply with two lines, exactly:\n\
+Answer: <your final answer, as short as the question allows>\n\
+Confidence: <a number from 0 to 1>\n\
+State a low confidence when unsure; a confident wrong answer is worse than an \
+honest hedge. Do not write the Answer line in the same turn as a code block — run \
+the code, read the output, then answer.";
+
 /// There is no 100 % confidence. 0.95 is the ceiling: it is the highest a
 /// calibrated answer may claim, and the most any answer records. A confidence
 /// *above* it is not evidence, it is a tell — an overconfident model claims
@@ -433,6 +454,231 @@ fn answer_once(
         .map_err(|e| EpisodeError::Agent(e.to_string()))?;
     let (answer, confidence) = extract_answer(&content);
     Ok(ReasoningAnswer { answer, confidence, tokens: usage.total(), raw: content })
+}
+
+/// A [`ReasoningSolver`] that lets the model call a Python tool mid-reasoning.
+///
+/// The "reason deeper" path: instead of one shot, the model may run code (bounded
+/// by `max_tool_steps`), read the exact output, and continue — decompose, compute,
+/// and self-verify before committing. It wraps a live [`Agent`](samaritan_agent::Agent)
+/// and drives the same `complete()` transport; because `complete()` is one-shot
+/// (no multi-turn), the loop is emulated in a single growing user message that
+/// carries the running tool log, which a thinking model handles fine.
+///
+/// Grading, calibration, and the confidence discipline are unchanged: `solve`
+/// applies [`should_rethink`]/[`cap_confidence`] exactly as the single-shot impl
+/// does, and returns the same [`ReasoningAnswer`] — with `tokens` **summed across
+/// every model call** so the compute budget stays honest, and the tool transcript
+/// folded into `raw` so a verified solve is still learnable.
+///
+/// Confinement is the caller's choice, expressed by which working directory and
+/// interpreter are handed in: this shells `python` in a scratch directory via
+/// [`samaritan_exec::proc::run`], which on a PathChecked-style host runs the code
+/// directly (fast, trusted). Point it only at a model trusted not to emit hostile
+/// code, or give it a container-backed working directory.
+pub struct ToolLoopSolver<'a> {
+    agent: &'a samaritan_agent::Agent,
+    /// Hard cap on tool iterations, so a model that never converges still stops.
+    max_tool_steps: u32,
+    /// The Python interpreter to shell (e.g. `python` / `python3`).
+    python_bin: String,
+    /// Per-execution wall-clock limit.
+    exec_timeout: Duration,
+    /// Working directory for the subprocess.
+    work_dir: PathBuf,
+}
+
+impl<'a> ToolLoopSolver<'a> {
+    pub fn new(
+        agent: &'a samaritan_agent::Agent,
+        max_tool_steps: u32,
+        python_bin: impl Into<String>,
+        exec_timeout: Duration,
+        work_dir: PathBuf,
+    ) -> Self {
+        Self {
+            agent,
+            max_tool_steps: max_tool_steps.max(1),
+            python_bin: python_bin.into(),
+            exec_timeout,
+            work_dir,
+        }
+    }
+
+    /// One tool-using pass. `reconsider` carries a prior answer to re-examine (the
+    /// skeptical second pass), mirroring [`answer_once`].
+    fn run_loop(
+        &self,
+        question: &str,
+        lessons: &[String],
+        reconsider: Option<&str>,
+    ) -> Result<ReasoningAnswer, EpisodeError> {
+        let mut base = question.to_string();
+        if !lessons.is_empty() {
+            base.push_str(&format!("\n\nKeep in mind:\n- {}", lessons.join("\n- ")));
+        }
+        if let Some(prior) = reconsider {
+            base.push_str(&format!(
+                "\n\nYour first answer was: {prior}\nYou were highly confident, but \
+                 overconfidence is a common failure and certainty is never warranted. \
+                 Re-examine skeptically — use the Python tool to check it — then give \
+                 your final answer and a calibrated confidence no higher than 0.95."
+            ));
+        }
+
+        let cfg = self.agent.config();
+        let mut tool_log = String::new();
+        let mut total_tokens = 0u64;
+        let mut last = String::new();
+
+        for _ in 0..self.max_tool_steps {
+            let user = if tool_log.is_empty() {
+                base.clone()
+            } else {
+                format!("{base}\n\n{tool_log}Give your final Answer and Confidence, or run more Python.")
+            };
+            let (content, usage) = self
+                .agent
+                .complete(TOOL_LOOP_SYSTEM, &user, None, None, cfg.temperature, cfg.seed.unwrap_or(0))
+                .map_err(|e| EpisodeError::Agent(e.to_string()))?;
+            total_tokens += usage.total();
+            last = content.clone();
+
+            // Committed a final answer? Take it — don't run more code.
+            if has_final_answer(&content) {
+                break;
+            }
+            // Asked to run code? Run it and feed the exact output back.
+            match extract_python_block(&content) {
+                Some(code) => {
+                    let out = proc::run(
+                        &self.python_bin,
+                        &["-c".to_string(), code.clone()],
+                        &self.work_dir,
+                        self.exec_timeout,
+                        &[],
+                    );
+                    tool_log.push_str(&format!(
+                        "You ran:\n```python\n{}\n```\nOutput:\n{}\n\n",
+                        code.trim(),
+                        truncate(&format_tool_output(&out), 4000),
+                    ));
+                }
+                // No answer and no code — nothing more to do; grade what's there.
+                None => break,
+            }
+        }
+
+        let (answer, confidence) = extract_answer(&last);
+        let raw = if tool_log.is_empty() { last } else { format!("{tool_log}\n{last}") };
+        Ok(ReasoningAnswer { answer, confidence, tokens: total_tokens, raw })
+    }
+}
+
+impl ReasoningSolver for ToolLoopSolver<'_> {
+    fn solve(&self, question: &str, lessons: &[String]) -> Result<ReasoningAnswer, EpisodeError> {
+        let first = self.run_loop(question, lessons, None)?;
+        // Same overconfidence re-pass as the single-shot solver: a claim above the
+        // cap is re-examined (with the tool available again), and its tokens add to
+        // the first pass so the cost is honest.
+        let chosen = if should_rethink(first.confidence) {
+            let mut second = self.run_loop(question, lessons, Some(&first.answer))?;
+            second.tokens += first.tokens;
+            second
+        } else {
+            first
+        };
+        Ok(ReasoningAnswer { confidence: cap_confidence(chosen.confidence), ..chosen })
+    }
+}
+
+/// True once the reply has committed a final answer — a line beginning `answer:`
+/// in the post-`</think>` body. The loop stops here rather than running more code.
+/// A mid-reasoning mention ("to find the answer:") does not count, because it is
+/// not the start of a line.
+fn has_final_answer(content: &str) -> bool {
+    let body = match content.rfind("</think>") {
+        Some(i) => &content[i + "</think>".len()..],
+        None => content,
+    };
+    body.lines().any(|l| {
+        let l = l.trim_start_matches(['#', '*', '-', ' ', '\t']).to_lowercase();
+        l.starts_with("answer:") || l.starts_with("final answer:")
+    })
+}
+
+/// Lift the first fenced Python block out of a reply, or `None`. Accepts
+/// ```` ```python ````, ```` ```py ````, or a bare ```` ``` ```` fence, and skips
+/// fenced blocks in other languages — the tool-call counterpart of the diff
+/// lifter the level-3 proposer already uses.
+fn extract_python_block(content: &str) -> Option<String> {
+    let mut rest = content;
+    loop {
+        let open = rest.find("```")?;
+        let after = &rest[open + 3..];
+        let nl = after.find('\n')?;
+        let tag = after[..nl].trim().to_lowercase();
+        let body = &after[nl + 1..];
+        let close = body.find("```")?;
+        let code = &body[..close];
+        if tag.is_empty() || tag == "python" || tag == "py" {
+            return Some(code.to_string());
+        }
+        rest = &body[close + 3..];
+    }
+}
+
+/// Render a subprocess result for the model: stdout, any stderr, and the exit
+/// status — so it can react to an error as readily as to a value.
+fn format_tool_output(out: &proc::Output) -> String {
+    let mut s = String::new();
+    if !out.stdout.trim().is_empty() {
+        s.push_str(out.stdout.trim_end());
+        s.push('\n');
+    }
+    if !out.stderr.trim().is_empty() {
+        s.push_str("[stderr] ");
+        s.push_str(out.stderr.trim_end());
+        s.push('\n');
+    }
+    s.push_str(&match &out.completion {
+        proc::Completion::Exited { code } => format!("[exit {code}]"),
+        proc::Completion::TimedOut { after_secs } => format!("[timed out after {after_secs}s]"),
+        proc::Completion::Unstartable { detail } => format!("[could not run python: {detail}]"),
+    });
+    if s.trim().is_empty() { "[no output]".to_string() } else { s }
+}
+
+#[cfg(test)]
+mod tool_loop_tests {
+    use super::{extract_python_block, has_final_answer};
+
+    #[test]
+    fn extracts_a_python_fence() {
+        let s = "Let me compute.\n```python\nprint(6*7)\n```\nfrom that...";
+        assert_eq!(extract_python_block(s).as_deref(), Some("print(6*7)\n"));
+    }
+
+    #[test]
+    fn accepts_py_and_bare_and_skips_other_languages() {
+        assert_eq!(extract_python_block("```py\nx=1\n```").as_deref(), Some("x=1\n"));
+        assert_eq!(extract_python_block("```\nz=3\n```").as_deref(), Some("z=3\n"));
+        // a json block is skipped in favour of the later python one
+        let s = "```json\n{\"a\":1}\n```\nthen\n```python\ny=2\n```";
+        assert_eq!(extract_python_block(s).as_deref(), Some("y=2\n"));
+    }
+
+    #[test]
+    fn no_fence_is_none() {
+        assert_eq!(extract_python_block("just prose, no code here"), None);
+    }
+
+    #[test]
+    fn final_answer_only_on_an_answer_line() {
+        assert!(has_final_answer("<think>work</think>\nAnswer: 42\nConfidence: 0.9"));
+        // a mid-reasoning mention is not a commitment to stop
+        assert!(!has_final_answer("I need to find the answer: let me run code first"));
+    }
 }
 
 /// Lift the final answer and stated confidence out of a reasoning reply.

@@ -36,7 +36,7 @@ use std::time::Duration;
 
 use samaritan_agent::{Agent, AgentConfig, Constrain};
 use samaritan_corpus::{load_reasoning, Split};
-use samaritan_episode::{run_reasoning_episode, EpisodeConfig, Ending};
+use samaritan_episode::{run_reasoning_episode, EpisodeConfig, Ending, ReasoningSolver, ToolLoopSolver};
 use samaritan_ledger::{FixedClock, Ledger};
 
 /// A trivial, verifiable smoke set across a few domains. Not an evaluation — a
@@ -72,6 +72,16 @@ fn main() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(|| 900.max(u64::from(max_tokens) / 20 + 300));
+    // Optional code-execution tool loop. USE_TOOLS=1 turns it on: the model may run
+    // Python mid-reasoning and self-verify before answering. MAX_TOOL_STEPS bounds
+    // iterations, PYTHON_BIN picks the interpreter, TOOL_TIMEOUT_SECS caps one run.
+    let use_tools = std::env::var("USE_TOOLS").map(|v| v == "1" || v == "true").unwrap_or(false);
+    let max_tool_steps: u32 =
+        std::env::var("MAX_TOOL_STEPS").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
+    let python_bin = std::env::var("PYTHON_BIN").unwrap_or_else(|_| "python".into());
+    let tool_timeout = Duration::from_secs(
+        std::env::var("TOOL_TIMEOUT_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(60),
+    );
 
     let (text, source) = match std::env::var("DATASET") {
         Ok(path) => match std::fs::read_to_string(&path) {
@@ -116,9 +126,30 @@ fn main() {
         ..Default::default()
     });
 
+    // PathChecked-style: the tool loop shells `python` in a scratch dir on this
+    // host (fast, trusted). The solver is chosen once here — the tool loop when
+    // USE_TOOLS is set, else the single-shot Agent — and the episode path below is
+    // identical for both.
+    let work_dir = std::env::temp_dir().join("samaritan-toolloop");
+    let _ = std::fs::create_dir_all(&work_dir);
+    let tool_solver = use_tools.then(|| {
+        ToolLoopSolver::new(&agent, max_tool_steps, python_bin.clone(), tool_timeout, work_dir.clone())
+    });
+    let solver: &dyn ReasoningSolver = match &tool_solver {
+        Some(s) => s,
+        None => &agent,
+    };
+
     println!("server:  {base_url}");
     println!("dataset: {source} ({} items, showing {})", corpus.tasks.len(), tasks.len());
-    println!("budget:  {max_tokens} tok/item, {timeout_secs}s request timeout\n");
+    println!("budget:  {max_tokens} tok/item, {timeout_secs}s request timeout");
+    if use_tools {
+        println!(
+            "tools:   python loop, up to {max_tool_steps} steps, {}s each",
+            tool_timeout.as_secs()
+        );
+    }
+    println!();
 
     let mut ledger = Ledger::in_memory(Box::new(FixedClock("2026-09-13T00:00:00Z".into()))).unwrap();
     let cfg = EpisodeConfig::default();
@@ -190,7 +221,7 @@ fn main() {
             continue;
         }
 
-        let out = match run_reasoning_episode(t, &agent, &mut ledger, &cfg) {
+        let out = match run_reasoning_episode(t, solver, &mut ledger, &cfg) {
             Ok(o) => o,
             Err(e) => {
                 println!("  q{:>2} [{}]  ERROR: {e}", i + 1, t.domain());
