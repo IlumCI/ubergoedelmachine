@@ -9,7 +9,7 @@
   needed) and writes it as the `{question, answer, answer_kind, domain, split}`
   lines `samaritan_corpus::load_reasoning` reads.
 
-  Three sets, all public and all exact-match:
+  Four sets, all public and all exact-match:
 
     gsm8k          openai/gsm8k — grade-school math, the standard set.
     gsm-symbolic   apple/GSM-Symbolic — GSM8K's templates regenerated with fresh
@@ -22,6 +22,10 @@
                    difficulty. Integer answers (0-999), so the numeric grader
                    scores them exactly — a hard eval with no LLM judge needed.
                    Only 30 problems, so the number is a coarse but honest probe.
+    aime26         MathArena/aime_2026 — same format, one year newer. NOT
+                   contamination-cleaner for a model released after Feb 2026 (the
+                   contest predates it); use it for more N and a 2025-vs-2026
+                   cross-check. Difficulty measures reasoning depth, not recall.
 
   Prefer gsm-symbolic as the *held-out* measure precisely because it cannot have
   leaked into any base model's training the way GSM8K has. GPQA and HLE are not
@@ -55,7 +59,7 @@
   or train.
 #>
 param(
-    [ValidateSet("gsm8k", "gsm-symbolic", "aime25")][string]$Dataset = "gsm-symbolic",
+    [ValidateSet("gsm8k", "gsm-symbolic", "aime25", "aime26")][string]$Dataset = "gsm-symbolic",
     [ValidateSet("main", "p1", "p2")][string]$Variant = "p2",
     [ValidateSet("train", "test")][string]$Split = "test",
     [int]$Count = 200,
@@ -73,6 +77,13 @@ $extract = {
     @{ question = $row.question; answer = (($row.answer -split '####')[-1].Trim() -replace ',', '') }
 }
 
+# AIME sets (aime25, aime26): the statement is the question and the gold answer
+# is an integer, taken verbatim so the numeric grader matches it exactly.
+$extractAime = {
+    param($row)
+    @{ question = $row.problem; answer = ("$($row.answer)").Trim() }
+}
+
 # Per-dataset specifics: the HF repo, its config, the domain, and the extractor.
 $spec = switch ($Dataset) {
     "gsm8k" {
@@ -84,30 +95,37 @@ $spec = switch ($Dataset) {
         @{ Repo = "apple/GSM-Symbolic"; Config = $Variant; Domain = "math"; Extract = $extract; Tag = "gsm-symbolic-$Variant" }
     }
     "aime25" {
-        # A real step up from grade-school: AIME 2025 competition math. Answers
-        # are integers 0-999, so the numeric grader scores them exactly — a hard
-        # eval that still needs no LLM judge. 30 problems (Count caps higher but
-        # the fetch stops when the set runs out). Config is `default`, split test.
-        $extractAime = {
-            param($row)
-            @{ question = $row.problem; answer = ("$($row.answer)").Trim() }
-        }
-        @{ Repo = "math-ai/aime25"; Config = "default"; Domain = "math"; Extract = $extractAime; Tag = "aime25" }
+        # A real step up from grade-school: AIME 2025 competition math. Integer
+        # answers (0-999) → the numeric grader scores them exactly, no LLM judge.
+        # 30 problems (Count may cap higher; the fetch stops when the set runs out).
+        @{ Repo = "math-ai/aime25"; Config = "default"; Split = "test"; Domain = "math"; Extract = $extractAime; Tag = "aime25" }
+    }
+    "aime26" {
+        # AIME 2026 (MathArena), same integer-answer format, one year newer — but
+        # NOT contamination-cleaner for a model released after Feb 2026 (e.g.
+        # Qwen3.8, Aug 2026): the contest predates the model, so it was likely in
+        # training. Use it for more N and a 2025-vs-2026 cross-check, not as a clean
+        # held-out. Source split is `train`; 30 problems.
+        @{ Repo = "MathArena/aime_2026"; Config = "default"; Split = "train"; Domain = "math"; Extract = $extractAime; Tag = "aime26" }
     }
 }
+
+# A dataset may pin its own source split (aime26 lives in `train`); otherwise use
+# the -Split parameter.
+$srcSplit = if ($spec.Contains("Split")) { $spec.Split } else { $Split }
 
 if (-not $Out) {
     $Out = Join-Path "$env:USERPROFILE\models\reasoning" "$($spec.Tag).jsonl"
 }
 
 $repoEnc = [System.Uri]::EscapeDataString($spec.Repo)
-Write-Host ("fetching {0} [{1}] x{2} -> {3}" -f $spec.Repo, $Split, $Count, $Out) -ForegroundColor Cyan
+Write-Host ("fetching {0} [{1}] x{2} -> {3}" -f $spec.Repo, $srcSplit, $Count, $Out) -ForegroundColor Cyan
 
 $rows = New-Object System.Collections.Generic.List[object]
 $offset = 0
 while ($rows.Count -lt $Count) {
     $len = [Math]::Min(100, $Count - $rows.Count)
-    $url = "https://datasets-server.huggingface.co/rows?dataset=$repoEnc&config=$($spec.Config)&split=$Split&offset=$offset&length=$len"
+    $url = "https://datasets-server.huggingface.co/rows?dataset=$repoEnc&config=$($spec.Config)&split=$srcSplit&offset=$offset&length=$len"
     try {
         $resp = Invoke-RestMethod -Uri $url -TimeoutSec 60
     } catch {
