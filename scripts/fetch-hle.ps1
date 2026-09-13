@@ -22,6 +22,7 @@
 .EXAMPLE
   scripts\fetch-hle.ps1 -HfToken hf_xxx -Count 500
   $env:HLE_DATASET = "$env:USERPROFILE\models\hle\hle-text.jsonl"
+  $env:RESUME = "$env:USERPROFILE\models\hle\hle-text.progress.jsonl"
   $env:JUDGE = "1"; $env:SAMARITAN_MODEL = "samaritan-playout:latest"
   cargo run -p samaritan-eval --example hle    # with SAMARITAN_URL pointed at the A100
 
@@ -115,7 +116,9 @@ $utf8NoBom = New-Object System.Text.UTF8Encoding $false
 [System.IO.File]::WriteAllLines($Out, $lines, $utf8NoBom)
 
 Write-Host ("wrote {0} text-only questions to {1}" -f $lines.Count, $Out) -ForegroundColor Green
+$progress = $Out -replace '\.jsonl$', '.progress.jsonl'
 Write-Host "next (with the A100 served and SAMARITAN_URL set):" -ForegroundColor Cyan
 Write-Host ("  `$env:HLE_DATASET=`"{0}`"; `$env:JUDGE=`"1`"; `$env:SAMARITAN_MODEL=`"samaritan-playout:latest`"" -f $Out) -ForegroundColor DarkGray
+Write-Host ("  `$env:RESUME=`"{0}`"   # crash-safe: a Colab drop only re-does unfinished items" -f $progress) -ForegroundColor DarkGray
 Write-Host "  cargo run -p samaritan-eval --example hle" -ForegroundColor DarkGray
 Write-Host "Do not commit or redistribute this file (HLE license)." -ForegroundColor Yellow

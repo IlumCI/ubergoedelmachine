@@ -23,8 +23,16 @@
 //!   SAMARITAN_API_KEY bearer key if the server wants one (e.g. a tunnelled A100)
 //!   SAMARITAN_MODEL   served model name (default samaritan-playout; Ollama needs
 //!                     the tag, e.g. samaritan-playout:latest)
-//!   MAX_TOKENS        solver answer budget (default 8192 — a thinking model needs
-//!                     room or it truncates before its final answer)
+//!   MAX_TOKENS        solver answer budget (default 32768 — a reasoning floor;
+//!                     HLE questions run long and truncate before the final answer
+//!                     at a small budget)
+//!   HTTP_TIMEOUT_SECS per-request timeout override; the default scales with
+//!                     MAX_TOKENS, because a big budget needs the wall-clock to
+//!                     spend it or the request aborts as a transport timeout
+//!   RESUME            path to a progress JSONL ({question, correct}); scored items
+//!                     are skipped and new ones appended, so a dropped tunnel costs
+//!                     only the unfinished items. Rerun with the same RESUME to
+//!                     continue; delete it for a fresh run.
 //!   TEMPERATURE       solver temperature (default 0.3)
 //!   JUDGE             truthy to grade with the LLM judge
 //!   JUDGE_URL / JUDGE_MODEL  judge endpoint (default: the solver's)
@@ -67,7 +75,15 @@ fn main() {
     // wants SAMARITAN_MODEL=samaritan-playout:latest. Bare name for local llama.cpp.
     let model = std::env::var("SAMARITAN_MODEL").unwrap_or_else(|_| "samaritan-playout".into());
     let max_tokens: u32 =
-        std::env::var("MAX_TOKENS").ok().and_then(|s| s.parse().ok()).unwrap_or(8192);
+        std::env::var("MAX_TOKENS").ok().and_then(|s| s.parse().ok()).unwrap_or(32768);
+    // Per-request timeout must track the token budget: at the A100's ~30-40 tok/s a
+    // big answer needs many minutes, and a fixed 900s wall aborts it mid-generation
+    // as `transport: timeout: global` (the q14 failure on AIME). Scale it;
+    // HTTP_TIMEOUT_SECS overrides. Same formula as reason_eval.
+    let timeout_secs: u64 = std::env::var("HTTP_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| 900.max(u64::from(max_tokens) / 20 + 300));
     let temperature: f64 =
         std::env::var("TEMPERATURE").ok().and_then(|s| s.parse().ok()).unwrap_or(0.3);
     let use_judge = std::env::var("JUDGE").ok().map(|v| truthy(&v)).unwrap_or(false);
@@ -86,6 +102,7 @@ fn main() {
     println!("server:  {base_url}");
     println!("model:   {model}");
     println!("grading: {method}");
+    println!("budget:  {max_tokens} tok/item, {timeout_secs}s request timeout");
     println!("scoring {} questions from {dataset}\n", questions.len());
 
     let solver = Agent::new(AgentConfig {
@@ -96,7 +113,7 @@ fn main() {
         max_tokens,
         repeat_penalty: 1.1,
         constrain: Constrain::None,
-        timeout: Duration::from_secs(900),
+        timeout: Duration::from_secs(timeout_secs),
         max_retries: 1,
         seed: Some(1),
         ..Default::default()
@@ -127,13 +144,51 @@ fn main() {
         None
     };
 
+    // Resumable, like reason_eval: RESUME names a JSONL of {question, correct}
+    // already scored; those are skipped and each new one is appended as it lands,
+    // so a dropped tunnel mid-run costs only the unfinished items. Keyed by the
+    // question text, so it survives a new tunnel URL. Delete the file for a fresh
+    // run (e.g. after the model changes).
+    let resume_path = std::env::var("RESUME").ok().filter(|s| !s.is_empty());
+    let mut done: std::collections::HashMap<String, bool> = Default::default();
+    if let Some(p) = &resume_path {
+        if let Ok(txt) = std::fs::read_to_string(p) {
+            for line in txt.lines().filter(|l| !l.trim().is_empty()) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                    if let Some(qq) = v["question"].as_str() {
+                        done.insert(qq.to_string(), v["correct"].as_bool().unwrap_or(false));
+                    }
+                }
+            }
+            if !done.is_empty() {
+                println!("resume: {} item(s) already scored in {p}\n", done.len());
+            }
+        }
+    }
+    let mut resume_file = resume_path.as_ref().map(|p| {
+        std::fs::OpenOptions::new().create(true).append(true).open(p).expect("open RESUME file")
+    });
+
     let mut verdicts: Vec<bool> = Vec::with_capacity(questions.len());
+    let mut failed = 0usize; // solver transport failures — not wrong answers
     for (i, q) in questions.iter().enumerate() {
+        // Scored on a prior run? Count the cached verdict and skip the model call.
+        if let Some(&correct) = done.get(&q.question) {
+            verdicts.push(correct);
+            println!("q{:>3}: {}  [cached]", i + 1, if correct { "OK  " } else { "MISS" });
+            continue;
+        }
+
         let prompt = format!(
             "{}\n\nReason it through, then end with your final answer, as concisely \
              as the question allows.",
             q.question
         );
+        // A solver transport failure (a dropped tunnel, a 5xx) is not a wrong
+        // answer: count it apart, keep it out of the score, and do NOT write it to
+        // RESUME so it retries next run — otherwise a flaky endpoint reads as the
+        // model missing and tanks the number. An empty-but-successful reply is a
+        // real miss (the model answered nothing), so that still grades normally.
         let reply = match solver.complete(
             "You are taking a hard exam. Answer each question precisely.",
             &prompt,
@@ -144,8 +199,10 @@ fn main() {
         ) {
             Ok((content, _)) => content,
             Err(e) => {
-                eprintln!("q{}: model error: {e}", i + 1);
-                String::new()
+                failed += 1;
+                let d: String = e.to_string().replace('\n', " ").chars().take(200).collect();
+                println!("q{:>3}: FAIL  {d}", i + 1);
+                continue;
             }
         };
         let ans = answer_body(&reply).to_string();
@@ -170,6 +227,14 @@ fn main() {
 
         let shown: String = ans.lines().next_back().unwrap_or("").trim().chars().take(80).collect();
         println!("q{:>3}: {}  {:?}", i + 1, if correct { "OK  " } else { "MISS" }, shown);
+
+        // Persist per item so a later crash resumes past it.
+        if let Some(f) = resume_file.as_mut() {
+            use std::io::Write as _;
+            let rec = serde_json::json!({ "question": q.question.as_str(), "correct": correct });
+            let _ = writeln!(f, "{rec}");
+            let _ = f.flush();
+        }
     }
 
     let result = tally_verdicts(&verdicts);
@@ -179,6 +244,9 @@ fn main() {
         result.total,
         result.score() * 100.0
     );
+    if failed > 0 {
+        println!("not answered:  {failed} lost to server/transport errors (excluded from score)");
+    }
     if use_judge {
         println!("(LLM-judged — closer to official HLE than a string match, but the judge \
                   is itself a model; not an official score.)");

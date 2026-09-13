@@ -61,6 +61,17 @@ fn main() {
     // two are independent — a budget under the window never gets silently trimmed.
     let max_tokens: u32 =
         std::env::var("MAX_TOKENS").ok().and_then(|s| s.parse().ok()).unwrap_or(32768);
+    // The client's hard wall on one request, and it MUST track the token budget.
+    // At the A100's ~30-40 tok/s a 65k-token answer needs ~30 min, so a fixed 900s
+    // timeout aborts a big-budget generation mid-thought and reports it as a
+    // transport failure — the model was still working, it just outran the clock.
+    // Default to a budget-derived ceiling (a conservative ~20 tok/s floor + margin);
+    // HTTP_TIMEOUT_SECS overrides. The request returns as soon as the model stops,
+    // so this only caps the worst case, it doesn't spend it.
+    let timeout_secs: u64 = std::env::var("HTTP_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| 900.max(u64::from(max_tokens) / 20 + 300));
 
     let (text, source) = match std::env::var("DATASET") {
         Ok(path) => match std::fs::read_to_string(&path) {
@@ -99,14 +110,15 @@ fn main() {
         max_tokens,
         repeat_penalty: 1.1,
         constrain: Constrain::None,
-        timeout: Duration::from_secs(900),
+        timeout: Duration::from_secs(timeout_secs),
         max_retries: 1,
         seed: Some(seed),
         ..Default::default()
     });
 
     println!("server:  {base_url}");
-    println!("dataset: {source} ({} items, showing {})\n", corpus.tasks.len(), tasks.len());
+    println!("dataset: {source} ({} items, showing {})", corpus.tasks.len(), tasks.len());
+    println!("budget:  {max_tokens} tok/item, {timeout_secs}s request timeout\n");
 
     let mut ledger = Ledger::in_memory(Box::new(FixedClock("2026-09-13T00:00:00Z".into()))).unwrap();
     let cfg = EpisodeConfig::default();
