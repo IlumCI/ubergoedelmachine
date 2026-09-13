@@ -444,11 +444,15 @@ impl Agent {
             });
         }
 
+        // An empty reply is not a transport error: a thinking model can spend its
+        // whole token budget and never reach a final answer. Return it and let the
+        // caller grade it as a non-answer (a MISS), so a truncated item is not
+        // mistaken for a server failure. SAMARITAN_STREAM=1 echoes tokens live.
+        let live = std::env::var("SAMARITAN_STREAM")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(false);
         let reader = std::io::BufReader::new(resp.body_mut().as_reader());
-        let (content, usage) = accumulate_sse(reader)?;
-        if content.is_empty() {
-            return Err(AgentError::Shape("streamed reply had no content".into()));
-        }
+        let (content, usage) = accumulate_sse(reader, live)?;
         Ok((content, usage))
     }
 }
@@ -478,9 +482,17 @@ fn retry_backoff(attempt: u32) -> std::time::Duration {
 /// that are not `data:` (SSE comments / keep-alives) and any chunk that does not
 /// parse are skipped, so a stray keep-alive never derails a reply. Kept pure and
 /// reader-generic so it is unit-testable without a live server.
-fn accumulate_sse<R: std::io::BufRead>(reader: R) -> Result<(String, Usage), AgentError> {
+fn accumulate_sse<R: std::io::BufRead>(reader: R, live: bool) -> Result<(String, Usage), AgentError> {
+    use std::io::Write as _;
     let mut content = String::new();
+    let mut reasoning = String::new();
     let mut usage = Usage { prompt_tokens: 0, completion_tokens: 0, cached_tokens: 0 };
+    let echo = |tok: &str| {
+        if live {
+            print!("{tok}");
+            let _ = std::io::stdout().flush();
+        }
+    };
     for line in reader.lines() {
         let line = line.map_err(|e| AgentError::Transport(e.to_string()))?;
         let data = match line.trim().strip_prefix("data:") {
@@ -494,10 +506,22 @@ fn accumulate_sse<R: std::io::BufRead>(reader: R) -> Result<(String, Usage), Age
             Ok(v) => v,
             Err(_) => continue,
         };
-        if let Some(tok) = v["choices"][0]["delta"]["content"].as_str() {
+        let delta = &v["choices"][0]["delta"];
+        if let Some(tok) =
+            delta["content"].as_str().or_else(|| v["choices"][0]["message"]["content"].as_str())
+        {
             content.push_str(tok);
-        } else if let Some(tok) = v["choices"][0]["message"]["content"].as_str() {
-            content.push_str(tok);
+            echo(tok);
+        }
+        // A thinking model's reasoning is often streamed in a separate field
+        // (reasoning_content, or reasoning) with only the final answer in content.
+        // Capture it so the trace is not lost and a reply that is all-reasoning
+        // (a truncated, answer-less item) does not look empty.
+        if let Some(tok) =
+            delta["reasoning_content"].as_str().or_else(|| delta["reasoning"].as_str())
+        {
+            reasoning.push_str(tok);
+            echo(tok);
         }
         if !v["usage"].is_null() {
             usage = Usage {
@@ -511,7 +535,18 @@ fn accumulate_sse<R: std::io::BufRead>(reader: R) -> Result<(String, Usage), Age
             };
         }
     }
-    Ok((content, usage))
+    if live {
+        println!();
+    }
+    // Fold separated reasoning back into a <think> block, so the answer-extractor
+    // sees the shape it already handles and nothing is lost. If the server inlined
+    // its thinking into content, reasoning is empty and content passes through.
+    let full = match (reasoning.is_empty(), content.is_empty()) {
+        (false, false) => format!("<think>{reasoning}</think>\n{content}"),
+        (false, true) => format!("<think>{reasoning}</think>"),
+        (true, _) => content,
+    };
+    Ok((full, usage))
 }
 
 /// Pull the JSON object out of a possibly-wrapped reply. Public so other
@@ -617,10 +652,35 @@ mod tests {
             "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2}}\n",
             "data: [DONE]\n",
         );
-        let (content, usage) = accumulate_sse(std::io::Cursor::new(stream)).unwrap();
+        let (content, usage) = accumulate_sse(std::io::Cursor::new(stream), false).unwrap();
         assert_eq!(content, "Hello");
         assert_eq!(usage.prompt_tokens, 5);
         assert_eq!(usage.completion_tokens, 2);
+    }
+
+    #[test]
+    fn sse_folds_separated_reasoning_into_a_think_block() {
+        // A server that streams the trace in reasoning_content and only the answer
+        // in content — the reasoning is folded back so nothing is lost.
+        let stream = concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"6*7 is 42\"}}]}\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Answer: 42\"}}]}\n",
+            "data: [DONE]\n",
+        );
+        let (full, _) = accumulate_sse(std::io::Cursor::new(stream), false).unwrap();
+        assert_eq!(full, "<think>6*7 is 42</think>\nAnswer: 42");
+    }
+
+    #[test]
+    fn sse_reasoning_only_reply_keeps_its_trace_and_is_not_empty() {
+        // The truncated-thinking case: all reasoning, no final answer. It must come
+        // back as its trace (to be graded a MISS), not as an empty transport error.
+        let stream = concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning\":\"still thinking\"}}]}\n",
+            "data: [DONE]\n",
+        );
+        let (full, _) = accumulate_sse(std::io::Cursor::new(stream), false).unwrap();
+        assert_eq!(full, "<think>still thinking</think>");
     }
 
     #[test]
@@ -633,7 +693,7 @@ mod tests {
             "data: {\"choices\":[{\"delta\":{\"content\":\"B\"}}]}\n",
             "data: [DONE]\n",
         );
-        let (content, _) = accumulate_sse(std::io::Cursor::new(stream)).unwrap();
+        let (content, _) = accumulate_sse(std::io::Cursor::new(stream), false).unwrap();
         assert_eq!(content, "AB");
     }
 
