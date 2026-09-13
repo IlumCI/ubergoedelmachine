@@ -62,13 +62,21 @@ apt-get -qq install -y zstd || (apt-get -qq update && apt-get -qq install -y zst
 rm -rf /usr/local/lib/ollama
 curl -fsSL https://ollama.com/install.sh | sh
 ls /usr/local/lib/ollama/llama-server   # must exist; if not, the install is broken
-OLLAMA_KEEP_ALIVE=-1 nohup ollama serve > ollama.log 2>&1 &
+# Flash attention + an 8-bit KV cache roughly halve the context cache (the quant
+# only takes effect with FA on); together they're what lets a 128k window fit next
+# to the ~30 GB model on 40 GB.
+OLLAMA_KEEP_ALIVE=-1 OLLAMA_FLASH_ATTENTION=1 OLLAMA_KV_CACHE_TYPE=q8_0 nohup ollama serve > ollama.log 2>&1 &
 # Qwen3.8-27B (Q8_0, ~30 GB) is the strong reasoning model that fits 40 GB. The
 # -mtp- build adds the multi-token-prediction draft head (self-speculative decode,
 # faster gen at equal quality). Copy it to samaritan-playout (the alias the harness
-# asks for) with a 16k context baked in — it thinks hard by default.
+# asks for) with a 128k context baked in. num_ctx is load-bearing: past it Ollama
+# does NOT error, it silently drops the oldest tokens, so a long derivation forgets
+# its own early work and loops — the real cause of the answer-less truncations we
+# saw at the old 16k. The hybrid attention (only 16 of 64 layers keep a growing KV
+# cache) + the q8 cache hold 128k to ~4 GB. (262144 is the model's max, but at ~8 GB
+# of cache it sits at the 40 GB edge — 131072 is the safe floor.)
 ollama pull qwen3.8:27b-mtp-q8_0
-printf 'FROM qwen3.8:27b-mtp-q8_0\nPARAMETER num_ctx 16384\n' > Modelfile
+printf 'FROM qwen3.8:27b-mtp-q8_0\nPARAMETER num_ctx 131072\n' > Modelfile
 ollama create samaritan-playout -f Modelfile
 # publish port 11434. --http-host-header is required: Ollama returns 403 for any
 # Host but localhost (DNS-rebinding guard), so rewrite it before the origin.
@@ -83,7 +91,11 @@ prediction draft head for self-speculative decoding (faster generation at equal
 quality). There is no Q6_K in the Ollama library for the 27B and bf16 (56 GB) won't
 fit, so Q8_0 is the tag; plain `qwen3.8:27b-q8_0` (no MTP) or `qwen3.8:27b`
 (Q4_K_M, 18 GB) are fallbacks. We serve GGUF via Ollama rather than FP8 via vLLM
-because vLLM has no FP8-MoE support on the A100 (see the constraints above). To read
+because vLLM has no FP8-MoE support on the A100 (see the constraints above). Serve
+it with a **128k `num_ctx`** and flash attention + `q8_0` KV cache on: the window
+must exceed the longest thinking trace or Ollama silently trims the front of the
+derivation (it does not error), which is what stalled the hardest AIME items at the
+old 16k. To read
 real throughput, hit Ollama's native `/api/chat` (`stream:false`) and divide
 `eval_count` by `eval_duration` — that's server-side, so it's clean decode speed.
 Ollama has **no API-key auth**, so the random tunnel URL is the only guard — stop
@@ -95,7 +107,7 @@ the runtime when done.
 $env:SAMARITAN_URL = "https://<random>.trycloudflare.com/v1"   # the tunnel URL + /v1
 $env:SAMARITAN_API_KEY = "ollama"                              # any value; Ollama ignores it
 $env:SAMARITAN_MODEL = "samaritan-playout:latest"             # Ollama matches the tag exactly
-$env:MAX_TOKENS = "8192"                                       # Qwen3.8 thinks a lot
+$env:MAX_TOKENS = "32768"                                      # gen budget; reason_eval defaults to this now
 $env:DATASET = "$env:USERPROFILE\models\reasoning\gsm-symbolic-p2.jsonl"
 cargo run -p samaritan-run --example reason_eval    # now answered by Qwen3.8-27B on the A100
 ```

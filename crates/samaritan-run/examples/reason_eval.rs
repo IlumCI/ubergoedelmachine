@@ -21,7 +21,10 @@
 //!                     ones appended, so a dropped runtime costs only the unfinished
 //!                     items. Rerun with the same RESUME (and new URL) to continue;
 //!                     delete the file for a fresh run.
-//!   SEED, MAX_TOKENS  sampling controls.
+//!   MAX_TOKENS        per-item generation budget (default 32768 — a reasoning
+//!                     floor). Independent of the server's context window; keep it
+//!                     under num_ctx and a trace is never silently trimmed.
+//!   SEED              sampling seed.
 //!
 //! The built-in questions are deliberately easy — they prove the pipeline end to
 //! end (prompt -> think -> answer -> grade -> score). A real signal needs a real
@@ -52,8 +55,12 @@ fn main() {
         std::env::var("SAMARITAN_URL").unwrap_or_else(|_| "http://127.0.0.1:8080/v1".into());
     let limit: usize = std::env::var("LIMIT").ok().and_then(|s| s.parse().ok()).unwrap_or(20);
     let seed = std::env::var("SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
+    // Generation budget per item. A reasoning floor, not the old 2048: a hard
+    // problem needs room to actually finish its derivation. This is the *budget*;
+    // the server's num_ctx is the *window* (128k in docs/colab-remote.md), and the
+    // two are independent — a budget under the window never gets silently trimmed.
     let max_tokens: u32 =
-        std::env::var("MAX_TOKENS").ok().and_then(|s| s.parse().ok()).unwrap_or(2048);
+        std::env::var("MAX_TOKENS").ok().and_then(|s| s.parse().ok()).unwrap_or(32768);
 
     let (text, source) = match std::env::var("DATASET") {
         Ok(path) => match std::fs::read_to_string(&path) {
