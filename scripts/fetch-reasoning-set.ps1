@@ -9,7 +9,7 @@
   needed) and writes it as the `{question, answer, answer_kind, domain, split}`
   lines `samaritan_corpus::load_reasoning` reads.
 
-  Two sets, both public and both exact-match:
+  Three sets, all public and all exact-match:
 
     gsm8k          openai/gsm8k — grade-school math, the standard set.
     gsm-symbolic   apple/GSM-Symbolic — GSM8K's templates regenerated with fresh
@@ -18,6 +18,10 @@
                    originals, not the reasoning. Use -Variant to pick the tier:
                    main, p1 (one extra clause), or p2 (two — the hardest, and the
                    one that most separates reasoning from recall).
+    aime25         math-ai/aime25 — AIME 2025 competition math, a real step up in
+                   difficulty. Integer answers (0-999), so the numeric grader
+                   scores them exactly — a hard eval with no LLM judge needed.
+                   Only 30 problems, so the number is a coarse but honest probe.
 
   Prefer gsm-symbolic as the *held-out* measure precisely because it cannot have
   leaked into any base model's training the way GSM8K has. GPQA and HLE are not
@@ -51,7 +55,7 @@
   or train.
 #>
 param(
-    [ValidateSet("gsm8k", "gsm-symbolic")][string]$Dataset = "gsm-symbolic",
+    [ValidateSet("gsm8k", "gsm-symbolic", "aime25")][string]$Dataset = "gsm-symbolic",
     [ValidateSet("main", "p1", "p2")][string]$Variant = "p2",
     [ValidateSet("train", "test")][string]$Split = "test",
     [int]$Count = 200,
@@ -78,6 +82,17 @@ $spec = switch ($Dataset) {
         # The memorization-robust variant: templates regenerated with fresh
         # numbers/names, so it cannot have leaked into a base model's training.
         @{ Repo = "apple/GSM-Symbolic"; Config = $Variant; Domain = "math"; Extract = $extract; Tag = "gsm-symbolic-$Variant" }
+    }
+    "aime25" {
+        # A real step up from grade-school: AIME 2025 competition math. Answers
+        # are integers 0-999, so the numeric grader scores them exactly — a hard
+        # eval that still needs no LLM judge. 30 problems (Count caps higher but
+        # the fetch stops when the set runs out). Config is `default`, split test.
+        $extractAime = {
+            param($row)
+            @{ question = $row.problem; answer = ("$($row.answer)").Trim() }
+        }
+        @{ Repo = "math-ai/aime25"; Config = "default"; Domain = "math"; Extract = $extractAime; Tag = "aime25" }
     }
 }
 
