@@ -373,7 +373,14 @@ impl Agent {
             "temperature": temperature,
             "max_tokens": self.cfg.max_tokens,
             "repeat_penalty": self.cfg.repeat_penalty,
-            "stream": false,
+            // Stream the reply. A buffered (stream:false) response sends nothing
+            // until the whole generation is done, so a long answer that outruns a
+            // tunnel's response timeout (Cloudflare's is ~100s) is cut off as a
+            // 524 even though the model is still working. Streaming flows bytes
+            // immediately, so the timeout never fires however long generation
+            // runs. include_usage puts the token counts in the final chunk.
+            "stream": true,
+            "stream_options": {"include_usage": true},
             "seed": seed,
             // llama.cpp: reuse the cached prefix rather than reprocessing it.
             // Unknown keys are ignored by servers that do not implement them.
@@ -437,24 +444,11 @@ impl Agent {
             });
         }
 
-        let v: serde_json::Value = resp
-            .body_mut()
-            .read_json()
-            .map_err(|e| AgentError::Shape(e.to_string()))?;
-
-        let content = v["choices"][0]["message"]["content"]
-            .as_str()
-            .ok_or_else(|| AgentError::Shape(format!("no message content in {v}")))?
-            .to_string();
-
-        let usage = Usage {
-            prompt_tokens: v["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
-            completion_tokens: v["usage"]["completion_tokens"].as_u64().unwrap_or(0),
-            cached_tokens: v["usage"]["prompt_tokens_details"]["cached_tokens"]
-                .as_u64()
-                .unwrap_or(0),
-        };
-
+        let reader = std::io::BufReader::new(resp.body_mut().as_reader());
+        let (content, usage) = accumulate_sse(reader)?;
+        if content.is_empty() {
+            return Err(AgentError::Shape("streamed reply had no content".into()));
+        }
         Ok((content, usage))
     }
 }
@@ -474,6 +468,50 @@ fn is_transient_status(status: u16) -> bool {
 fn retry_backoff(attempt: u32) -> std::time::Duration {
     let secs = 0.5_f64 * 2_f64.powi((attempt.saturating_sub(1)) as i32);
     std::time::Duration::from_millis((secs.min(8.0) * 1000.0) as u64)
+}
+
+/// Assemble an OpenAI-style SSE stream into the full content and token usage.
+///
+/// Reads `data: {chunk}` lines, appends each `choices[0].delta.content`, stops at
+/// `data: [DONE]` (or EOF), and takes the `usage` object from whichever chunk
+/// carries it — the final one, sent because we ask for `include_usage`. Lines
+/// that are not `data:` (SSE comments / keep-alives) and any chunk that does not
+/// parse are skipped, so a stray keep-alive never derails a reply. Kept pure and
+/// reader-generic so it is unit-testable without a live server.
+fn accumulate_sse<R: std::io::BufRead>(reader: R) -> Result<(String, Usage), AgentError> {
+    let mut content = String::new();
+    let mut usage = Usage { prompt_tokens: 0, completion_tokens: 0, cached_tokens: 0 };
+    for line in reader.lines() {
+        let line = line.map_err(|e| AgentError::Transport(e.to_string()))?;
+        let data = match line.trim().strip_prefix("data:") {
+            Some(d) => d.trim(),
+            None => continue,
+        };
+        if data == "[DONE]" {
+            break;
+        }
+        let v: serde_json::Value = match serde_json::from_str(data) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if let Some(tok) = v["choices"][0]["delta"]["content"].as_str() {
+            content.push_str(tok);
+        } else if let Some(tok) = v["choices"][0]["message"]["content"].as_str() {
+            content.push_str(tok);
+        }
+        if !v["usage"].is_null() {
+            usage = Usage {
+                prompt_tokens: v["usage"]["prompt_tokens"].as_u64().unwrap_or(usage.prompt_tokens),
+                completion_tokens: v["usage"]["completion_tokens"]
+                    .as_u64()
+                    .unwrap_or(usage.completion_tokens),
+                cached_tokens: v["usage"]["prompt_tokens_details"]["cached_tokens"]
+                    .as_u64()
+                    .unwrap_or(usage.cached_tokens),
+            };
+        }
+    }
+    Ok((content, usage))
 }
 
 /// Pull the JSON object out of a possibly-wrapped reply. Public so other
@@ -568,6 +606,48 @@ mod tests {
     fn nested_objects_are_kept_whole() {
         let s = r#"{"a":{"b":{"c":1}}}"#;
         assert_eq!(extract_json(s), s);
+    }
+
+    #[test]
+    fn sse_stream_assembles_content_and_usage() {
+        let stream = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n",
+            "\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n",
+            "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2}}\n",
+            "data: [DONE]\n",
+        );
+        let (content, usage) = accumulate_sse(std::io::Cursor::new(stream)).unwrap();
+        assert_eq!(content, "Hello");
+        assert_eq!(usage.prompt_tokens, 5);
+        assert_eq!(usage.completion_tokens, 2);
+    }
+
+    #[test]
+    fn sse_skips_keepalives_and_unparsable_lines() {
+        // An SSE comment, a garbled chunk, and a usage-only tail must not derail it.
+        let stream = concat!(
+            ": keep-alive\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"A\"}}]}\n",
+            "data: not-json\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"B\"}}]}\n",
+            "data: [DONE]\n",
+        );
+        let (content, _) = accumulate_sse(std::io::Cursor::new(stream)).unwrap();
+        assert_eq!(content, "AB");
+    }
+
+    #[test]
+    fn transient_statuses_retry_but_refusals_do_not() {
+        assert!(is_transient_status(529));
+        assert!(is_transient_status(524));
+        assert!(is_transient_status(503));
+        assert!(!is_transient_status(200));
+        assert!(!is_transient_status(400));
+        assert!(!is_transient_status(404));
+        // Backoff grows with the attempt and stays capped.
+        assert!(retry_backoff(1) < retry_backoff(3));
+        assert!(retry_backoff(10) <= std::time::Duration::from_secs(8));
     }
 }
 
