@@ -920,6 +920,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "samaritan-curriculum"
+version = "0.1.0"
+dependencies = [
+ "samaritan-corpus",
+ "serde_json",
+]
+
+[[package]]
 name = "samaritan-dsl"
 version = "0.1.0"
 dependencies = [
