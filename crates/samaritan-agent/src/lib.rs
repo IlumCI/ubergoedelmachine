@@ -462,10 +462,15 @@ impl Agent {
 /// model still loading, without stalling a run for minutes.
 const MAX_HTTP_ATTEMPTS: u32 = 5;
 
-/// Transient HTTP statuses worth retrying: overload, rate-limit, gateway, timeout.
-/// Everything else the server understood and refused, so it should not be retried.
+/// Transient HTTP statuses worth retrying: overload, rate-limit, gateway/timeout,
+/// and the Cloudflare tunnel/origin family (520-527, 530) — a quick tunnel that
+/// briefly drops usually reconnects within the backoff window. Everything else the
+/// server understood and refused, so it should not be retried.
 fn is_transient_status(status: u16) -> bool {
-    matches!(status, 408 | 429 | 500 | 502 | 503 | 504 | 522 | 524 | 529)
+    matches!(
+        status,
+        408 | 429 | 500 | 502 | 503 | 504 | 520 | 521 | 522 | 523 | 524 | 525 | 526 | 527 | 529 | 530
+    )
 }
 
 /// Exponential backoff before retry `attempt` (1-based): 0.5s, 1s, 2s, 4s, 8s cap.
@@ -702,6 +707,8 @@ mod tests {
         assert!(is_transient_status(529));
         assert!(is_transient_status(524));
         assert!(is_transient_status(503));
+        assert!(is_transient_status(530)); // Cloudflare tunnel drop — reconnects
+        assert!(is_transient_status(520));
         assert!(!is_transient_status(200));
         assert!(!is_transient_status(400));
         assert!(!is_transient_status(404));

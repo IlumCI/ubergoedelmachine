@@ -10,11 +10,17 @@
 //! wins one domain is not reasoning, it is remembering.
 //!
 //! Env:
-//!   SAMARITAN_URL   model server (default http://127.0.0.1:8080/v1) — run
-//!                   `serve.ps1 -Role solver` first.
-//!   DATASET         reasoning JSONL to evaluate. Omit to use the trivial
-//!                   built-in smoke set (a pipeline check, NOT a real eval).
-//!   LIMIT           cap the number of items (default 20; the model is slow).
+//!   SAMARITAN_URL     model server (default http://127.0.0.1:8080/v1) — run
+//!                     `serve.ps1 -Role solver`, or a remote one (docs/colab-remote.md).
+//!   SAMARITAN_API_KEY / SAMARITAN_MODEL  key and served-model name for a remote
+//!                     endpoint (Ollama needs the tag, e.g. samaritan-playout:latest).
+//!   DATASET           reasoning JSONL to evaluate. Omit to use the trivial
+//!                     built-in smoke set (a pipeline check, NOT a real eval).
+//!   LIMIT             cap the number of items (default 20; the model is slow).
+//!   RESUME            path to a progress JSONL: answered items are skipped and new
+//!                     ones appended, so a dropped runtime costs only the unfinished
+//!                     items. Rerun with the same RESUME (and new URL) to continue;
+//!                     delete the file for a fresh run.
 //!   SEED, MAX_TOKENS  sampling controls.
 //!
 //! The built-in questions are deliberately easy — they prove the pipeline end to
@@ -22,6 +28,7 @@
 //! corpus (a NuminaMath/GPQA slice, an HLE held-out subset); those are
 //! operator-supplied, like the knowledge base and the eval grader.
 
+use std::io::Write;
 use std::time::Duration;
 
 use samaritan_agent::{Agent, AgentConfig, Constrain};
@@ -98,12 +105,72 @@ fn main() {
     let cfg = EpisodeConfig::default();
 
     let mut solved = 0usize;
+    let mut completed = 0usize; // items the model actually answered (and were graded)
+    let mut failed = 0usize; // server/transport failures — not the model's answer
     let mut conf_sum = 0.0;
     let mut brier_sum = 0.0;
     // domain -> (correct, total)
     let mut by_domain: std::collections::BTreeMap<String, (usize, usize)> = Default::default();
 
+    // Resumable runs: if RESUME names a file, load per-item results already in it
+    // and skip those questions, appending each new one as it completes. A dropped
+    // Colab runtime then costs only the unfinished items — reconnect, set the new
+    // SAMARITAN_URL, rerun with the same RESUME, and it continues. Failed items are
+    // NOT written, so they retry next run. (Delete the file for a fresh run, e.g.
+    // after the model changes.) Keyed by the question text, so it survives a new
+    // tunnel URL and a reordered file, but not an edited question.
+    let resume_path = std::env::var("RESUME").ok().filter(|s| !s.is_empty());
+    let mut done: std::collections::HashMap<String, (bool, f64, u64)> = Default::default();
+    if let Some(p) = &resume_path {
+        if let Ok(txt) = std::fs::read_to_string(p) {
+            for line in txt.lines().filter(|l| !l.trim().is_empty()) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                    if let Some(q) = v["question"].as_str() {
+                        done.insert(
+                            q.to_string(),
+                            (
+                                v["correct"].as_bool().unwrap_or(false),
+                                v["confidence"].as_f64().unwrap_or(0.5),
+                                v["tokens"].as_u64().unwrap_or(0),
+                            ),
+                        );
+                    }
+                }
+            }
+            if !done.is_empty() {
+                println!("resume: {} item(s) already answered in {p}\n", done.len());
+            }
+        }
+    }
+    let mut resume_file = resume_path.as_ref().map(|p| {
+        std::fs::OpenOptions::new().create(true).append(true).open(p).expect("open RESUME file")
+    });
+
     for (i, t) in tasks.iter().enumerate() {
+        // Answered on a prior run? Count the cached result and skip the model call.
+        if let Some(&(correct, conf, tokens)) = done.get(&t.prompt) {
+            completed += 1;
+            if correct {
+                solved += 1;
+            }
+            conf_sum += conf;
+            brier_sum += (conf - if correct { 1.0 } else { 0.0 }).powi(2);
+            let e = by_domain.entry(t.domain().to_string()).or_insert((0, 0));
+            e.1 += 1;
+            if correct {
+                e.0 += 1;
+            }
+            println!(
+                "  q{:>2} [{:<9}] {}  conf {:.2}  ({} tok)  [cached]",
+                i + 1,
+                t.domain(),
+                if correct { "OK  " } else { "MISS" },
+                conf,
+                tokens,
+            );
+            continue;
+        }
+
         let out = match run_reasoning_episode(t, &agent, &mut ledger, &cfg) {
             Ok(o) => o,
             Err(e) => {
@@ -111,6 +178,19 @@ fn main() {
                 continue;
             }
         };
+
+        // A server/transport failure — a dropped tunnel, a 5xx — is not a wrong
+        // answer. Surface it, count it separately, and keep it out of accuracy and
+        // calibration: otherwise a flaky endpoint reads as the model missing, and
+        // one tunnel death late in a run tanks the whole score.
+        if let Ending::AgentFailed { detail } = &out.ending {
+            failed += 1;
+            let d: String = detail.replace('\n', " ").chars().take(300).collect();
+            println!("  q{:>2} [{:<9}] FAIL  {}", i + 1, t.domain(), d);
+            continue;
+        }
+
+        completed += 1;
         let correct = out.ending.solved();
         let (conf, _) = out.predictions.first().copied().unwrap_or((0.5, false));
         if correct {
@@ -124,38 +204,49 @@ fn main() {
         if correct {
             e.0 += 1;
         }
-        let label = match &out.ending {
-            Ending::AgentFailed { .. } => "FAIL",
-            _ if correct => "OK  ",
-            _ => "MISS",
-        };
         println!(
             "  q{:>2} [{:<9}] {}  conf {:.2}  ({} tok)",
             i + 1,
             t.domain(),
-            label,
+            if correct { "OK  " } else { "MISS" },
             conf,
             out.tokens,
         );
-        // A model/server failure is not a wrong answer — surface the reason
-        // (HTTP status + body) instead of hiding it as a MISS. This is what an
-        // all-zero run needs: a 404 model-not-found or a 403 reads plainly here.
-        if let Ending::AgentFailed { detail } = &out.ending {
-            let d: String = detail.replace('\n', " ").chars().take(300).collect();
-            println!("        agent failed: {d}");
-        } else if !correct {
-            // A real miss: show what the model actually answered — the fastest
-            // way to tell a reasoning error from an extraction/grading edge.
+        // On a real miss, show what the model actually answered — the fastest way
+        // to tell a reasoning error from an extraction/grading edge.
+        if !correct {
             if let Some(a) = &out.answer {
                 let a: String = a.replace('\n', " ").chars().take(100).collect();
                 println!("        got: {a:?}");
             }
         }
+
+        // Persist this answer so a later crash resumes past it. Flushed per item,
+        // so progress survives a hard runtime drop mid-run.
+        if let Some(f) = resume_file.as_mut() {
+            let rec = serde_json::json!({
+                "question": t.prompt,
+                "domain": t.domain(),
+                "correct": correct,
+                "confidence": conf,
+                "tokens": out.tokens,
+            });
+            let _ = writeln!(f, "{rec}");
+            let _ = f.flush();
+        }
     }
 
-    let n = tasks.len().max(1);
+    let n = completed.max(1);
     println!("\n── result ──────────────────────────────");
-    println!("accuracy:        {}/{} = {:.1}%", solved, tasks.len(), 100.0 * solved as f64 / n as f64);
+    println!(
+        "accuracy:        {}/{} answered = {:.1}%",
+        solved,
+        completed,
+        100.0 * solved as f64 / n as f64
+    );
+    if failed > 0 {
+        println!("not answered:    {failed} lost to server/transport errors (excluded from accuracy)");
+    }
     println!("mean confidence: {:.2}", conf_sum / n as f64);
     println!("Brier (calib):   {:.3}   (lower is better; 0.25 = always 0.5)", brier_sum / n as f64);
     println!("by domain:");
