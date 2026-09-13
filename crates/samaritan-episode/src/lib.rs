@@ -347,14 +347,22 @@ Confidence: <a number from 0 to 1>\n\
 State a low confidence when unsure. A confident wrong answer is worse than an \
 honest low-confidence one.";
 
-/// There is no 100 % confidence. A stated confidence at or above this is not
-/// evidence, it is a tell — an overconfident model says it about everything —
-/// so it is never recorded, and it triggers a second, skeptical pass.
+/// There is no 100 % confidence. 0.95 is the ceiling: it is the highest a
+/// calibrated answer may claim, and the most any answer records. A confidence
+/// *above* it is not evidence, it is a tell — an overconfident model claims
+/// certainty about everything — so it is capped to 0.95 when recorded and
+/// triggers a skeptical re-pass. Exactly 0.95 is allowed and taken as-is.
 pub const CONFIDENCE_CAP: f64 = 0.95;
 
 /// Whether a stated confidence is high enough to distrust and re-reason.
+///
+/// Strictly *above* the cap — the operator's rule is "100 %, or higher than
+/// 95 %". A calibrated answer at exactly 0.95 (the allowed ceiling, and the value
+/// a confident-but-honest model most often gives) is **not** re-thought: doing so
+/// spent a whole extra reasoning pass re-deriving a correct answer to land on the
+/// same 0.95, which is waste, not diligence.
 pub fn should_rethink(confidence: f64) -> bool {
-    confidence >= CONFIDENCE_CAP
+    confidence > CONFIDENCE_CAP
 }
 
 /// The recorded confidence, never above the cap.
@@ -754,9 +762,12 @@ mod reasoning_tests {
         assert_eq!(cap_confidence(1.0), CONFIDENCE_CAP);
         assert_eq!(cap_confidence(0.99), CONFIDENCE_CAP);
         assert!((cap_confidence(0.7) - 0.7).abs() < 1e-9);
-        // At or above the cap is distrusted and re-reasoned; below is taken.
+        // Strictly above the cap is distrusted and re-reasoned. Exactly 0.95 (the
+        // allowed ceiling) is taken as-is — re-thinking it just re-derives a
+        // correct answer to the same 0.95. Below is taken.
         assert!(should_rethink(1.0));
-        assert!(should_rethink(0.95));
+        assert!(should_rethink(0.96));
+        assert!(!should_rethink(0.95));
         assert!(!should_rethink(0.9));
     }
 
