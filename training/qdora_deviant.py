@@ -132,6 +132,47 @@ def gate(training: list[dict], min_positive: int, allow_small: bool) -> None:
         )
 
 
+def response_only_markers(tokenizer) -> tuple[str, str] | None:
+    """The (instruction, response) header strings for this base's chat template.
+
+    `train_on_responses_only` masks the loss to the assistant turn by splitting the
+    *rendered* prompt on the exact substrings that separate the user turn from the
+    assistant turn — and those are template-specific. Hardcoding one vendor's pair
+    is the bug this replaces: the Deviant's Ministral uses Mistral `[INST]`/`[/INST]`,
+    but a Qwen (ChatML) student uses `<|im_start|>` headers, and feeding the wrong
+    pair means the markers are never found, the mask covers the prompt too, and the
+    model learns to recite questions instead of answering them.
+
+    Detected from a rendered probe rather than the model name, so it follows the
+    template the tokenizer actually applies. Returns None for an unknown template,
+    which the caller turns into a loud warning rather than a silent full-text train.
+    """
+    try:
+        probe = tokenizer.apply_chat_template(
+            [
+                {"role": "user", "content": "PROBE_USER"},
+                {"role": "assistant", "content": "PROBE_ASSISTANT"},
+            ],
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+    except Exception:  # noqa: BLE001 — a template that won't render is an unknown one
+        return None
+    # ChatML — Qwen (the reasoning student) and many others.
+    if "<|im_start|>assistant" in probe:
+        return ("<|im_start|>user\n", "<|im_start|>assistant\n")
+    # Mistral / Ministral — the Deviant's base.
+    if "[/INST]" in probe:
+        return ("[INST]", "[/INST]")
+    # Llama-3 family.
+    if "<|start_header_id|>" in probe:
+        return (
+            "<|start_header_id|>user<|end_header_id|>\n\n",
+            "<|start_header_id|>assistant<|end_header_id|>\n\n",
+        )
+    return None
+
+
 def format_and_train(args: argparse.Namespace, training: list[dict]) -> None:
     # Imported here so --dry-run and the gate work without a GPU stack installed.
     try:
@@ -197,16 +238,30 @@ def format_and_train(args: argparse.Namespace, training: list[dict]) -> None:
         ),
     )
 
-    # Train on the assistant completion only — the attack, not the prompt. The
-    # marker strings are Mistral/Ministral's; adjust if the chat template differs.
-    try:
-        trainer = train_on_responses_only(
-            trainer,
-            instruction_part="[INST]",
-            response_part="[/INST]",
+    # Train on the assistant completion only — the answer, not the prompt it was
+    # given — or the model learns to recite the prompt back (guardrail #3). The
+    # marker strings are template-specific, so derive them from this base's own chat
+    # template: Qwen (ChatML) and the Deviant's Ministral (Mistral) need different
+    # pairs, and the wrong pair silently masks nothing.
+    markers = response_only_markers(tokenizer)
+    if markers is None:
+        print(
+            "warning: unrecognised chat template — cannot restrict loss to the response; "
+            "training on the FULL text (the model may learn to echo prompts). Add this "
+            "template's markers to response_only_markers() before trusting the result.",
+            file=sys.stderr,
         )
-    except Exception as e:  # noqa: BLE001 — a template mismatch should warn, not crash
-        print(f"warning: could not restrict loss to responses ({e}); training on the full text", file=sys.stderr)
+    else:
+        instruction_part, response_part = markers
+        print(f"masking loss to responses: instruction={instruction_part!r} response={response_part!r}")
+        try:
+            trainer = train_on_responses_only(
+                trainer,
+                instruction_part=instruction_part,
+                response_part=response_part,
+            )
+        except Exception as e:  # noqa: BLE001 — a template mismatch should warn, not crash
+            print(f"warning: could not restrict loss to responses ({e}); training on the full text", file=sys.stderr)
 
     if torch.cuda.is_available():
         print(f"training on {torch.cuda.get_device_name(0)}")
