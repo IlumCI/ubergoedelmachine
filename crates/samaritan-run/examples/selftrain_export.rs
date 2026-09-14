@@ -33,11 +33,14 @@
 //!   HTTP_TIMEOUT_SECS request timeout override; default scales with MAX_TOKENS
 //!                     (a big budget needs wall-clock, or it dies as a transport
 //!                     timeout — the q14 lesson).
-//!   RESUME            progress JSONL; defaults to <OUT>.progress.jsonl so a
+//!   SELFTRAIN_RESUME  progress JSONL; defaults to <OUT>.progress.jsonl so a
 //!                     dropped runtime costs only the unfinished items. Graded
 //!                     items (solved or missed) are skipped on rerun; transport
-//!                     failures are NOT recorded, so they retry. Set RESUME=""
-//!                     to disable; delete OUT and the progress file for a fresh run.
+//!                     failures are NOT recorded, so they retry. Set it to ""
+//!                     to disable; delete OUT and the progress file for a fresh
+//!                     run. Deliberately NOT named RESUME: reason_eval uses that,
+//!                     and a shell that ran both leaked this export's progress
+//!                     into the eval's file.
 //!   SEED              sampling seed.
 
 use std::io::Write as _;
@@ -126,7 +129,12 @@ fn main() {
     // tunnel. Every *graded* attempt (solved or missed) is recorded so a rerun
     // skips it; kept traces are appended to OUT as they land. Transport failures
     // are not recorded, so they retry on the next run.
-    let resume_path = match std::env::var("RESUME") {
+    // A DISTINCT env name from reason_eval's RESUME, on purpose. Both tools ran
+    // in one PowerShell session where RESUME was still set from the eval, so this
+    // export appended its progress into the eval's file and two schemas ended up
+    // interleaved. Distinct names stop that at the source; the schema guard below
+    // stops it even if a path is shared anyway.
+    let resume_path = match std::env::var("SELFTRAIN_RESUME") {
         Ok(p) => {
             let p = p.trim().to_string();
             if p.is_empty() { None } else { Some(p) }
@@ -138,8 +146,12 @@ fn main() {
         if let Ok(txt) = std::fs::read_to_string(p) {
             for line in txt.lines().filter(|l| !l.trim().is_empty()) {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-                    if let Some(q) = v["question"].as_str() {
-                        done.insert(q.to_string());
+                    // Ours only: a foreign row (reason_eval writes `correct`,
+                    // not `solved`) is ignored rather than silently misread.
+                    if v.get("solved").is_some() {
+                        if let Some(q) = v["question"].as_str() {
+                            done.insert(q.to_string());
+                        }
                     }
                 }
             }

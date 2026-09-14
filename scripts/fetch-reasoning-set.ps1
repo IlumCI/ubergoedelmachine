@@ -330,13 +330,28 @@ if ($Dataset -eq "blend") {
         @{ Name = "medxpertqa"; Count = 300 },
         @{ Name = "frames";     Count = 200 }
     )
-    $all = New-Object System.Collections.Generic.List[string]
+    $buckets = New-Object System.Collections.Generic.List[object]
     foreach ($m in $mix) {
         $spec = Get-Spec $m.Name
         $path = Join-Path $reasoningDir "$($spec.Tag).jsonl"
         $lines = Invoke-Fetch $spec $m.Count $label $path
-        foreach ($l in $lines) { $all.Add($l) }
+        $buckets.Add(@{ Name = $m.Name; Lines = @($lines) })
     }
+    # INTERLEAVE, do not concatenate. A run over this corpus can be cut short at
+    # any point (a Colab drop, a token budget, a LIMIT), and a dataset-ordered
+    # file would hand that run a single domain -- silently reproducing the
+    # math-only bias this blend exists to avoid. Each set is spread evenly across
+    # the final order by fractional position, so ANY prefix is domain-balanced.
+    $keyed = New-Object System.Collections.Generic.List[object]
+    foreach ($b in $buckets) {
+        $n = [Math]::Max(1, $b.Lines.Count)
+        for ($i = 0; $i -lt $b.Lines.Count; $i++) {
+            $keyed.Add([pscustomobject]@{
+                Key = ($i + 0.5) / $n; Set = $b.Name; Line = $b.Lines[$i]
+            })
+        }
+    }
+    $all = @($keyed | Sort-Object Key, Set | ForEach-Object { $_.Line })
     $blendOut = if ($Out) { $Out } else { Join-Path $reasoningDir "trainable-blend.jsonl" }
     $utf8NoBom = New-Object System.Text.UTF8Encoding $false
     [System.IO.File]::WriteAllLines($blendOut, $all, $utf8NoBom)

@@ -175,6 +175,11 @@ fn main() {
         if let Ok(txt) = std::fs::read_to_string(p) {
             for line in txt.lines().filter(|l| !l.trim().is_empty()) {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                    // Ours only: skip a foreign row (selftrain_export writes
+                    // `solved`), which would otherwise read as a wrong answer.
+                    if v.get("correct").is_none() {
+                        continue;
+                    }
                     if let Some(q) = v["question"].as_str() {
                         done.insert(
                             q.to_string(),
