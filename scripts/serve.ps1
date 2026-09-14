@@ -70,9 +70,18 @@
 .PARAMETER Ngl
   Override the role's default GPU-layer split. 0 (default) uses the measured
   best for the role.
+
+.PARAMETER ModelFile
+  Serve a specific GGUF from -ModelDir instead of the role's default. This is
+  what makes an A/B honest: a trained student and the base it was trained from
+  must be served through the SAME alias, settings, and -ngl, so the only thing
+  that differs between two eval runs is the weights.
+
+      scripts\serve.ps1 -ModelFile samaritan-student-v1-185trace-q4_k_m.gguf
 #>
 param(
     [ValidateSet("solver", "deviant")][string]$Role = "solver",
+    [string]$ModelFile = "",
     [int]$Ngl = 0,
     [int]$Port = 8080,
     [string]$ModelDir = "$env:USERPROFILE\models",
@@ -92,6 +101,12 @@ if ($Role -eq "solver") {
     $modelFile = "Huihui-Ministral-3-8B-Reasoning-2512-abliterated.Q6_K.gguf"
     $defaultNgl = 18
     $label = "Ministral-3 8B Q6_K abliterated (deviant)"
+}
+# An explicit -ModelFile wins over the role's default, so a variant (a trained
+# student, a different quant) serves through the identical path and alias.
+if ($ModelFile) {
+    $modelFile = $ModelFile
+    $label = "$ModelFile (override)"
 }
 if ($Ngl -le 0) { $Ngl = $defaultNgl }
 
