@@ -42,6 +42,18 @@
   Suppress the live token echo. Streaming is ON by default so you can watch the
   model reason; output goes straight to the console (no pipeline) because
   PowerShell buffers pipelines by line and token output has no newlines.
+
+.PARAMETER RemoteUrl
+  Serve from somewhere else (docs/colab/samaritan_serve_gguf.ipynb) instead of
+  loading into local LM Studio. The local side is then just reason_eval making
+  HTTP calls - a few MB resident - which is the difference between a 4 GB laptop
+  GPU being unusable for a night and not being touched at all.
+
+  Serving is one model at a time, so pass a single -Models entry naming whatever
+  the notebook has loaded. Do NOT split one model's items across two backends:
+  LM Studio and Ollama differ on the sampling knobs the harness does not pin
+  (top_k, top_p, min_p), so a progress file half-filled by each measures the
+  backend as much as the weights. Use a fresh -Tag when you change hosts.
 #>
 param(
     [int]$Limit = 60,
@@ -50,15 +62,31 @@ param(
     [string]$Tag = "",
     [string]$Dataset = "",
     [string[]]$Models = @("base-q4km","student-v1-q4km"),
-    [switch]$NoStream
+    [switch]$NoStream,
+    [string]$RemoteUrl = ""
 )
 $ErrorActionPreference = "Continue"
 $LMS  = "C:\Users\ilum\.lmstudio\bin\lms.exe"
 $repo = "C:\Users\ilum\Projects\memetoken"
 $out  = "$env:USERPROFILE\models\reasoning"
 
-& $LMS server start --port 1234 | Out-Null
-$env:SAMARITAN_URL   = "http://127.0.0.1:1234/v1"
+# `powershell -File script.ps1 -Models a,b` hands the binder ONE string "a,b",
+# not two elements - unlike dot-sourcing or -Command. Left alone, that becomes a
+# model key no server has, every item fails, and the run looks like a broken
+# tunnel rather than a broken argument. Split here so both call styles agree.
+$Models = $Models | ForEach-Object { $_ -split ',' } | Where-Object { $_.Trim() } | ForEach-Object { $_.Trim() }
+
+if ($RemoteUrl) {
+    if ($Models.Count -gt 1) {
+        Write-Host "-RemoteUrl serves one model at a time; got $($Models.Count): $($Models -join ', ')" -ForegroundColor Red
+        exit 1
+    }
+    $env:SAMARITAN_URL = $RemoteUrl.TrimEnd('/')
+    Write-Host "remote serving: $env:SAMARITAN_URL" -ForegroundColor Cyan
+} else {
+    & $LMS server start --port 1234 | Out-Null
+    $env:SAMARITAN_URL = "http://127.0.0.1:1234/v1"
+}
 $env:SAMARITAN_MODEL = "samaritan-playout"
 if (-not $Dataset) { $Dataset = "$out\generated-d2-s777.jsonl" }
 $env:DATASET   = $Dataset
@@ -70,10 +98,12 @@ Set-Location $repo
 
 foreach ($m in $Models) {
     Write-Host "`n=================== $m ===================" -ForegroundColor Cyan
-    & $LMS unload --all 2>$null | Out-Null
-    Start-Sleep -Seconds 3
-    & $LMS load $m --identifier samaritan-playout --gpu max -c $Ctx -y 2>$null | Out-Null
-    Start-Sleep -Seconds 3
+    if (-not $RemoteUrl) {
+        & $LMS unload --all 2>$null | Out-Null
+        Start-Sleep -Seconds 3
+        & $LMS load $m --identifier samaritan-playout --gpu max -c $Ctx -y 2>$null | Out-Null
+        Start-Sleep -Seconds 3
+    }
     $env:RESUME = "$out\ab$Tag-$m.progress.jsonl"
     $sw = [Diagnostics.Stopwatch]::StartNew()
     # Transcript rather than Tee-Object: a pipeline buffers by line, which would
@@ -84,5 +114,8 @@ foreach ($m in $Models) {
     $sw.Stop()
     Write-Host ("[$m] wall clock: {0:N1} min" -f $sw.Elapsed.TotalMinutes) -ForegroundColor Yellow
 }
-& $LMS unload --all 2>$null | Out-Null
+if (-not $RemoteUrl) { & $LMS unload --all 2>$null | Out-Null }
 Write-Host "`nDONE. Logs: $out\ab$Tag-*.log" -ForegroundColor Green
+if ($RemoteUrl) {
+    Write-Host "Remote runtime is still billing - stop the Colab keep-alive cell." -ForegroundColor Yellow
+}
