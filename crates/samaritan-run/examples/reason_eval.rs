@@ -276,8 +276,11 @@ fn main() {
             }
         }
 
-        // Persist this answer so a later crash resumes past it. Flushed per item,
-        // so progress survives a hard runtime drop mid-run.
+        // Persist this answer so a later crash resumes past it. sync_all, not
+        // flush: File is unbuffered, so flush() is a no-op and the record would
+        // sit in the OS page cache - safe from a killed process, but not from a
+        // power cut. One fsync per item is free next to a multi-minute
+        // generation, and this file is the only record a lost run leaves.
         if let Some(f) = resume_file.as_mut() {
             let rec = serde_json::json!({
                 "question": t.prompt,
@@ -287,7 +290,7 @@ fn main() {
                 "tokens": out.tokens,
             });
             let _ = writeln!(f, "{rec}");
-            let _ = f.flush();
+            let _ = f.sync_all();
         }
     }
 

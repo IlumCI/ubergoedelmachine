@@ -215,7 +215,9 @@ fn main() {
                     "domain": t.domain(),
                 });
                 let _ = writeln!(out_file, "{row}");
-                let _ = out_file.flush();
+                // fsync, not flush: a verified trace costs minutes of teacher
+                // time, so it should be on the disk before we move on.
+                let _ = out_file.sync_all();
                 kept += 1;
             }
         }
@@ -230,7 +232,7 @@ fn main() {
         if let Some(f) = progress_file.as_mut() {
             let rec = json!({ "question": t.prompt, "solved": ok });
             let _ = writeln!(f, "{rec}");
-            let _ = f.flush();
+            let _ = f.sync_all();
         }
     }
 
