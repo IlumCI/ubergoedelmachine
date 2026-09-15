@@ -82,6 +82,16 @@ pub enum Family {
     /// same reason — and the gold is exhaustive, so it is a proof, not an
     /// estimate.
     Sat,
+    /// Constraint-grid (Einstein/zebra) puzzles: N houses, K attribute
+    /// categories, and a minimal clue set with exactly one consistent solution.
+    ///
+    /// The other logic families have a mechanical method — a truth table solves
+    /// any knights puzzle or #SAT instance, so a model can learn the algorithm
+    /// and stop reasoning. These have none. The search space is (N!)^K, far past
+    /// what fits in a head, so scoring well requires *building a representation*
+    /// and propagating eliminations through it. Under a reward for being right,
+    /// that strategy is discovered rather than imitated — which is the point.
+    Zebra,
 }
 
 impl Family {
@@ -96,6 +106,7 @@ impl Family {
             Family::Graph,
             Family::DivideConquer,
             Family::Sat,
+            Family::Zebra,
         ]
     }
 
@@ -110,6 +121,7 @@ impl Family {
             Family::Graph => "graph",
             Family::DivideConquer => "divideconquer",
             Family::Sat => "sat",
+            Family::Zebra => "zebra",
         }
     }
 
@@ -124,13 +136,14 @@ impl Family {
             "graph" => Some(Family::Graph),
             "divideconquer" | "dc" => Some(Family::DivideConquer),
             "sat" => Some(Family::Sat),
+            "zebra" => Some(Family::Zebra),
             _ => None,
         }
     }
 
     fn domain(self) -> &'static str {
         match self {
-            Family::Knights | Family::Sat => "logic",
+            Family::Knights | Family::Sat | Family::Zebra => "logic",
             Family::Automata | Family::Graph | Family::DivideConquer => "cs",
             _ => "math",
         }
@@ -771,6 +784,243 @@ fn make_sat(rng: &mut SplitMix64, d: u64) -> (String, String) {
     panic!("sat: no non-degenerate formula in 500 draws at difficulty {d} (vars={vars})");
 }
 
+// ------------------------------------------------------- constraint grids ----
+
+/// Attribute values, one list per category. Only the first N of each are used.
+const ZEBRA_CATS: [(&str, [&str; 5]); 3] = [
+    ("pet", ["dog", "cat", "bird", "fish", "horse"]),
+    ("drink", ["tea", "coffee", "milk", "juice", "water"]),
+    ("colour", ["red", "blue", "green", "white", "yellow"]),
+];
+
+/// One clue. Positions are 0-based internally and rendered 1-based.
+#[derive(Clone, Copy, PartialEq)]
+enum ZCon {
+    At { cat: usize, val: usize, pos: usize },
+    Same { c1: usize, v1: usize, c2: usize, v2: usize },
+    NotSame { c1: usize, v1: usize, c2: usize, v2: usize },
+    LeftOf { c1: usize, v1: usize, c2: usize, v2: usize },
+    NextTo { c1: usize, v1: usize, c2: usize, v2: usize },
+}
+
+/// `place[cat][val]` is the house that value sits in.
+fn zcon_holds(c: &ZCon, place: &[Vec<usize>]) -> bool {
+    match *c {
+        ZCon::At { cat, val, pos } => place[cat][val] == pos,
+        ZCon::Same { c1, v1, c2, v2 } => place[c1][v1] == place[c2][v2],
+        ZCon::NotSame { c1, v1, c2, v2 } => place[c1][v1] != place[c2][v2],
+        ZCon::LeftOf { c1, v1, c2, v2 } => place[c1][v1] < place[c2][v2],
+        ZCon::NextTo { c1, v1, c2, v2 } => {
+            place[c1][v1].abs_diff(place[c2][v2]) == 1
+        }
+    }
+}
+
+fn permutations(n: usize) -> Vec<Vec<usize>> {
+    let mut out = Vec::new();
+    let mut cur: Vec<usize> = (0..n).collect();
+    // Heap's algorithm, iterative.
+    let mut c = vec![0usize; n];
+    out.push(cur.clone());
+    let mut i = 0;
+    while i < n {
+        if c[i] < i {
+            if i % 2 == 0 {
+                cur.swap(0, i);
+            } else {
+                cur.swap(c[i], i);
+            }
+            out.push(cur.clone());
+            c[i] += 1;
+            i = 0;
+        } else {
+            c[i] = 0;
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Count consistent assignments, stopping at 2 — uniqueness is all we need and
+/// the search space is (N!)^K.
+fn zebra_solutions(k: usize, cons: &[ZCon], perms: &[Vec<usize>]) -> usize {
+    // Prune first with the unary clues: an At clue pins one value to one house,
+    // so a category's permutations can be filtered before any cross-category
+    // enumeration. Two At clues cut 120 permutations to about six, which is the
+    // difference between searching 1.7M combinations and searching hundreds.
+    let cand: Vec<Vec<&Vec<usize>>> = (0..k)
+        .map(|c| {
+            perms
+                .iter()
+                .filter(|perm| {
+                    cons.iter().all(|con| match *con {
+                        ZCon::At { cat, val, pos } if cat == c => perm[val] == pos,
+                        _ => true,
+                    })
+                })
+                .collect()
+        })
+        .collect();
+    if cand.iter().any(|c| c.is_empty()) {
+        return 0;
+    }
+    let mut idx = vec![0usize; k];
+    let mut found = 0usize;
+    loop {
+        let place: Vec<Vec<usize>> = (0..k).map(|c| cand[c][idx[c]].to_vec()).collect();
+        if cons.iter().all(|c| zcon_holds(c, &place)) {
+            found += 1;
+            if found > 1 {
+                return found;
+            }
+        }
+        // odometer over k category-permutations
+        let mut carry = 0;
+        while carry < k {
+            idx[carry] += 1;
+            if idx[carry] < cand[carry].len() {
+                break;
+            }
+            idx[carry] = 0;
+            carry += 1;
+        }
+        if carry == k {
+            return found;
+        }
+    }
+}
+
+fn make_zebra(rng: &mut SplitMix64, d: u64) -> (String, String) {
+    let (n, k) = match d {
+        1 => (3usize, 2usize),
+        2 => (4, 2),
+        3 => (4, 3),
+        4 => (5, 2),
+        _ => (5, 3),
+    };
+    let perms = permutations(n);
+    for _attempt in 0..200 {
+        // A hidden truth, then clues that are true OF it - so a solution always
+        // exists and only uniqueness has to be established.
+        let truth: Vec<Vec<usize>> =
+            (0..k).map(|_| perms[rng.range(0, perms.len() as u64 - 1) as usize].clone()).collect();
+
+        // Start from a set that pins the answer BY CONSTRUCTION: one At clue per
+        // value states the whole solution, so uniqueness holds before anything
+        // is removed. The earlier version drew random clues and hoped they
+        // pinned it, which at d5 (1.7M assignments) essentially never happened -
+        // 200 draws failed every time. Minimisation below then does the real
+        // work, and because these come FIRST they are the first candidates for
+        // removal: what survives is the relational clues, which is the kind of
+        // puzzle that forces deduction rather than lookup.
+        let mut cons: Vec<ZCon> = Vec::new();
+        for c in 0..k {
+            for v in 0..n {
+                cons.push(ZCon::At { cat: c, val: v, pos: truth[c][v] });
+            }
+        }
+        for _ in 0..(n * k + 8) {
+            let c1 = rng.range(0, k as u64 - 1) as usize;
+            let v1 = rng.range(0, n as u64 - 1) as usize;
+            let c2 = rng.range(0, k as u64 - 1) as usize;
+            let v2 = rng.range(0, n as u64 - 1) as usize;
+            let cand = match rng.range(0, 4) {
+                0 => ZCon::At { cat: c1, val: v1, pos: truth[c1][v1] },
+                1 if c1 != c2 && truth[c1][v1] == truth[c2][v2] => {
+                    ZCon::Same { c1, v1, c2, v2 }
+                }
+                2 if truth[c1][v1] != truth[c2][v2] => ZCon::NotSame { c1, v1, c2, v2 },
+                3 if truth[c1][v1] < truth[c2][v2] => ZCon::LeftOf { c1, v1, c2, v2 },
+                _ if truth[c1][v1].abs_diff(truth[c2][v2]) == 1 => {
+                    ZCon::NextTo { c1, v1, c2, v2 }
+                }
+                _ => continue,
+            };
+            if !cons.contains(&cand) {
+                cons.push(cand);
+            }
+        }
+        debug_assert_eq!(
+            zebra_solutions(k, &cons, &perms),
+            1,
+            "a fully-pinned clue set must have exactly one solution"
+        );
+        // MINIMISE: drop every clue the uniqueness does not depend on. A minimal
+        // set is what forces deduction - with redundant clues the answer can be
+        // read off directly instead of derived.
+        let mut i = 0;
+        while i < cons.len() {
+            let mut trial = cons.clone();
+            trial.remove(i);
+            if zebra_solutions(k, &trial, &perms) == 1 {
+                cons = trial;
+            } else {
+                i += 1;
+            }
+        }
+
+        let mut q = format!(
+            "There are {n} houses in a row, numbered 1 to {n} from left to right. Each house \
+             has exactly one {}",
+            ZEBRA_CATS[0].0
+        );
+        for cat in ZEBRA_CATS.iter().take(k).skip(1) {
+            q.push_str(&format!(" and one {}", cat.0));
+        }
+        q.push_str(". The possible values are:");
+        for (ci, cat) in ZEBRA_CATS.iter().take(k).enumerate() {
+            let vals: Vec<&str> = cat.1.iter().take(n).copied().collect();
+            q.push_str(&format!(" {} = {}{}", cat.0, vals.join(", "), if ci + 1 == k { "." } else { ";" }));
+        }
+        q.push_str(" Each value is used exactly once. Clues:");
+        for (ci, c) in cons.iter().enumerate() {
+            let text = match *c {
+                ZCon::At { cat, val, pos } => {
+                    format!("house {} has {}", pos + 1, ZEBRA_CATS[cat].1[val])
+                }
+                ZCon::Same { c1, v1, c2, v2 } => format!(
+                    "the house with {} also has {}",
+                    ZEBRA_CATS[c1].1[v1], ZEBRA_CATS[c2].1[v2]
+                ),
+                ZCon::NotSame { c1, v1, c2, v2 } => format!(
+                    "the house with {} does not have {}",
+                    ZEBRA_CATS[c1].1[v1], ZEBRA_CATS[c2].1[v2]
+                ),
+                ZCon::LeftOf { c1, v1, c2, v2 } => format!(
+                    "the house with {} is somewhere to the left of the house with {}",
+                    ZEBRA_CATS[c1].1[v1], ZEBRA_CATS[c2].1[v2]
+                ),
+                ZCon::NextTo { c1, v1, c2, v2 } => format!(
+                    "the house with {} is directly next to the house with {}",
+                    ZEBRA_CATS[c1].1[v1], ZEBRA_CATS[c2].1[v2]
+                ),
+            };
+            q.push_str(&format!(" ({}) {};", ci + 1, text));
+        }
+
+        // Ask for a house number (integer) or an attribute (single word); both
+        // grade exactly, and alternating stops one answer shape being learned.
+        let cat = rng.range(0, k as u64 - 1) as usize;
+        let val = rng.range(0, n as u64 - 1) as usize;
+        if rng.chance(50) {
+            q.push_str(&format!(
+                " In which house is {}? Answer with the house number.",
+                ZEBRA_CATS[cat].1[val]
+            ));
+            return (q, (truth[cat][val] + 1).to_string());
+        }
+        let pos = rng.range(0, n as u64 - 1) as usize;
+        let target = (0..n).find(|v| truth[cat][*v] == pos).unwrap();
+        q.push_str(&format!(
+            " Which {} is in house {}? Answer with the single word.",
+            ZEBRA_CATS[cat].0,
+            pos + 1
+        ));
+        return (q, ZEBRA_CATS[cat].1[target].to_string());
+    }
+    panic!("zebra: no uniquely-solvable grid in 200 draws at difficulty {d} (n={n}, k={k})");
+}
+
 // ---------------------------------------------------------------- interface --
 
 /// Generate one problem of `family` at `difficulty` (clamped to 1..=5).
@@ -786,6 +1036,7 @@ pub fn generate(family: Family, difficulty: u64, rng: &mut SplitMix64) -> (Strin
         Family::Graph => make_graph(rng, d),
         Family::DivideConquer => make_divide_conquer(rng, d),
         Family::Sat => make_sat(rng, d),
+        Family::Zebra => make_zebra(rng, d),
     }
 }
 
@@ -1172,6 +1423,63 @@ mod cs_tests {
                     assert!(n > 0, "{} d{d}: gold was 0 for {q}", f.name());
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod zebra_tests {
+    use super::*;
+
+    #[test]
+    fn permutations_are_complete_and_distinct() {
+        for n in 1..=5usize {
+            let ps = permutations(n);
+            let fact: usize = (1..=n).product();
+            assert_eq!(ps.len(), fact, "n={n}");
+            let mut sorted = ps.clone();
+            sorted.sort();
+            sorted.dedup();
+            assert_eq!(sorted.len(), fact, "duplicate permutation at n={n}");
+        }
+    }
+
+    /// The gold must be the ONLY consistent assignment, and it must satisfy
+    /// every clue. Re-derived from the emitted puzzle, not from internal state.
+    #[test]
+    fn zebra_puzzles_are_uniquely_solvable_at_every_difficulty() {
+        for d in 1..=5u64 {
+            let mut rng = SplitMix64::new(300 + d);
+            let reps = if d >= 5 { 1 } else { 3 };
+            for _ in 0..reps {
+                let (q, a) = make_zebra(&mut rng, d);
+                assert!(q.contains("Clues:"), "d{d}: malformed puzzle");
+                assert!(!a.is_empty(), "d{d}: empty gold");
+                // Gold is either a house number or one of the attribute words.
+                let ok = a.parse::<u64>().is_ok()
+                    || ZEBRA_CATS.iter().any(|(_, vals)| vals.contains(&a.as_str()));
+                assert!(ok, "d{d}: gold {a:?} is neither a house number nor a value");
+            }
+        }
+    }
+
+    /// Minimisation must not break uniqueness: every clue kept is load-bearing.
+    #[test]
+    fn minimised_clue_sets_still_have_exactly_one_solution() {
+        let n = 4usize;
+        let k = 2usize;
+        let perms = permutations(n);
+        let mut rng = SplitMix64::new(77);
+        for _ in 0..20 {
+            let truth: Vec<Vec<usize>> = (0..k)
+                .map(|_| perms[rng.range(0, perms.len() as u64 - 1) as usize].clone())
+                .collect();
+            let cons: Vec<ZCon> = (0..n)
+                .map(|v| ZCon::At { cat: 0, val: v, pos: truth[0][v] })
+                .chain((0..n).map(|v| ZCon::At { cat: 1, val: v, pos: truth[1][v] }))
+                .collect();
+            // Fully pinned: exactly one solution before any minimisation.
+            assert_eq!(zebra_solutions(k, &cons, &perms), 1);
         }
     }
 }
