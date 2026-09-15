@@ -83,6 +83,26 @@ if ($RemoteUrl) {
     }
     $env:SAMARITAN_URL = $RemoteUrl.TrimEnd('/')
     Write-Host "remote serving: $env:SAMARITAN_URL" -ForegroundColor Cyan
+
+    # Probe once before evaluating. Without this an unreachable server - a stale
+    # tunnel, a stopped runtime, or a placeholder left in the URL - fails every
+    # item in turn and reads as 40 model failures rather than one bad argument.
+    $probe = "$($env:SAMARITAN_URL)/models"
+    try {
+        $r = Invoke-WebRequest -Uri $probe -Headers @{ Authorization = "Bearer ollama" } `
+                               -TimeoutSec 30 -UseBasicParsing
+        if ($r.Content -notmatch "samaritan-playout") {
+            Write-Host "reachable, but 'samaritan-playout' is not served there." -ForegroundColor Red
+            Write-Host "Re-run the notebook cell that creates the alias." -ForegroundColor Red
+            exit 1
+        }
+        Write-Host "preflight OK: samaritan-playout is served" -ForegroundColor Green
+    } catch {
+        Write-Host "cannot reach $probe" -ForegroundColor Red
+        Write-Host "  $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "Check the tunnel URL is current and the Colab keep-alive cell is running." -ForegroundColor Yellow
+        exit 1
+    }
 } else {
     & $LMS server start --port 1234 | Out-Null
     $env:SAMARITAN_URL = "http://127.0.0.1:1234/v1"
