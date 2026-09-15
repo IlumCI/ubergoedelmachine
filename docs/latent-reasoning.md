@@ -144,26 +144,129 @@ step-level supervision (SIM-CoT) to stop the collapse in §2, then latent RL
 which the current 185-trace corpus does not have, and which W7 could generate,
 since the generator knows the solution structure it built the problem from.
 
-**The specific risk.** Every result above starts from a base model and teaches it
-latent reasoning. Qwen3-4B-Thinking has already been heavily RL-trained to reason
-in tokens, and a staged latent curriculum would be fighting that prior rather
-than filling a vacuum. No source found that does this on top of an existing
-long-CoT reasoning model. That is the genuine unknown, and it is not addressed by
-any of the papers above.
+**The specific risk.** Every result in §1-§5 starts from a base model and teaches
+it latent reasoning. Qwen3-4B-Thinking has already been heavily RL-trained to
+reason in tokens, so a staged latent curriculum would be fighting that prior
+rather than filling a vacuum. **§7 resolves this** - the fix is to freeze the
+backbone - but it is the risk that would sink a naive attempt, and the reason not
+to simply fine-tune the thinking model into latent mode.
 
-## 7. Recommended order — unchanged by the research
+## 7. Every obstacle in §6 is already solved — by a different paper each
 
-1. **Plain GRPO first** (built, tested, ready). Its **per-family reward curves**
-   are the gate for three separate decisions: whether per-domain specialisation
-   is real (the [[hypernetwork]] question), which families are compressible
-   (SLT's premise), and whether token-level RL alone closes the truncation gap.
-   One run, three answers.
-2. **A latent SFT probe on the search families only** — knights, sat, zebra,
-   graph — where both §1 and §5 predict the win. If latent reasoning cannot beat
-   token CoT *there*, it will not beat it on modpow.
-3. **Latent-GRPO** only after a latent model exists to initialise it from; it is
-   a post-training method, not a from-scratch one.
+The first pass called the prior-fighting risk "the genuine unknown, unaddressed
+by any of the papers above". That was wrong; it is addressed, just not by the
+COCONUT line.
 
-The sequencing matters because the alternative is three unvalidated things at
-once — latent reasoning, latent RL, and a hypernetwork — with no way to attribute
-a failure to any of them.
+| obstacle | solution | source |
+|---|---|---|
+| Fighting the RL-trained token-CoT prior | **Freeze the backbone.** SoftCoT projects instance-specific soft thought tokens into a *frozen* model's representation space, explicitly to avoid catastrophic forgetting. The prior is not overwritten because the weights holding it are never touched. | SoftCoT (via [survey](https://arxiv.org/html/2604.02029v2)) |
+| Fixed, hand-chosen number of latent steps | **PLaT** models reasoning as a latent planning trajectory with a separate decoder, letting the model decide *when to stop* rather than running a preset count. | [2601.21358](https://arxiv.org/abs/2601.21358) |
+| Latent collapse on long chains | **SIM-CoT** step-level supervision (§2). | [2509.20317](https://arxiv.org/abs/2509.20317) |
+| Precision-critical steps over-compressed | **SLT** confidence gate, with automatic fallback to explicit CoT when the predicted span is unreliable. | [2605.25745](https://arxiv.org/abs/2605.25745) |
+| Latent RL instability | **Latent-GRPO** one-sided noise + advantage masking (§3). | [2604.27998](https://arxiv.org/abs/2604.27998) |
+| All-or-nothing commitment to latent mode | **ALAR** runs dual-mode: compact latent for routine steps, escalating to explicit CoT when deeper deliberation is needed. | [2606.02871](https://arxiv.org/abs/2606.02871) |
+
+The frozen-backbone result is the important one for this project, because it
+converts the largest risk into a design choice. Qwen3-4B-Thinking keeps every bit
+of its token reasoning; the latent machinery is additive. It also means the
+*fallback path is free* — an ALAR/SLT-style gate can escalate to the original
+model, which is still intact underneath.
+
+**Consequence: worst case stops being "we broke the model" and becomes "the gate
+never fires and we wasted the training run."** That is a much cheaper failure,
+and it is what makes this worth attempting at all.
+
+## 8. What Samaritan has that none of these papers had
+
+This is where the project is genuinely ahead, and it is not the model — it is
+W7.
+
+### 8.1 The expensive ingredient is free here
+
+Every method in §7 needs **step-level supervision**, and the PRM literature is
+largely a history of trying to obtain it affordably:
+
+- human annotation of each step — abandoned as unscalable
+- **MiPS / Monte Carlo rollouts** ([2402.02658](https://arxiv.org/pdf/2402.02658)):
+  sample many completions from a partial state and use the *fraction correct* as
+  a proxy label. Noisy, and costs N extra generations per step
+- generator–verifier frameworks that produce labels "without ground truth"
+
+W7 does not approximate. **The generator built each problem from an algorithm, so
+it already knows the true intermediate state at every step** — the
+square-and-multiply sequence for modpow, the successive congruence merges for
+crt, the constraint-propagation order for zebra, the assignment order for sat.
+
+That single fact supplies, at zero cost and zero noise, the three things the
+methods above each pay dearly for:
+
+1. **exact step boundaries** for COCONUT's staged curriculum, which otherwise has
+   to be segmented heuristically out of prose
+2. **exact targets for SIM-CoT's auxiliary decoder** — the mechanism that stops
+   latent collapse, and the one most sensitive to label quality
+3. **a perfect process reward model**, with no rollouts and no annotation
+
+No source was found combining a procedural generator's *native* step
+decomposition with latent-state supervision. Synthetic reasoning benchmarks with
+process traces exist; using generator-known intermediate states to supervise
+*continuous* thoughts appears to be open ground.
+
+The work is real but bounded: each family's generator must emit its solution
+trace alongside the answer. It knows it already — it computed the gold with it —
+so this is plumbing, not research.
+
+### 8.2 Compressibility is knowable a priori, not only learnable
+
+SLT *learns* a confidence gate to decide what may be compressed. Samaritan knows
+the algorithmic class of every problem by construction, and §1 and §5 agree on
+the split from opposite directions. So the gate can be **initialised from
+structure and then refined**, rather than discovered from scratch — and, more
+valuably, W7 is a curriculum deliberately spanning both classes, which makes it
+an instrument for *testing* SLT's premise rather than merely consuming it.
+
+### 8.3 Truncation is a free compression label
+
+This project measures something the literature does not have to hand: exactly
+which items hit the token cap. Tonight's run — 5 of the base's 6 failures and 9
+of the student's 10 — is a per-item label saying *this problem needs compression*.
+That is a ready-made curriculum for where latent reasoning should be pointed
+first, and a ready-made evaluation: does the truncation count fall?
+
+### 8.4 A cheaper way to get GRPO's group variance
+
+PLaT reports that when greedy decoding from a latent state gives a wrong answer,
+**the correct path is often still encoded in that same state**. If that holds,
+then decoding the answer several times from *one* latent chain yields a group
+with genuine variance — at the cost of the short answer decode rather than G full
+reasoning chains. GRPO's group could become ~G× cheaper, which matters because
+rollouts are the binding cost of every GRPO run.
+
+Two honest caveats. The gradient then flows mostly through the decode, and the
+shared latent chain receives an averaged signal — which is exactly Latent-GRPO's
+**latent mixture non-closure** failure, so it would need that paper's masking.
+And it is an inference from one reported observation, not a result. But it is
+cheap to test: decode k times from one latent state, grade each against a
+computed gold, and measure the recovery rate directly. W7 makes that a one-
+afternoon experiment, and a negative result is just as informative.
+
+## 9. Revised plan
+
+1. **Plain GRPO first** — built, tested, ready. Its per-family reward curves
+   answer three questions at once: is per-domain specialisation real (the
+   hypernetwork gate), which families are compressible (SLT's premise, §5), and
+   does token-level RL alone close the truncation gap.
+2. **Teach the W7 generators to emit solution traces** (§8.1). Independent of
+   everything else, cheap, and it is the prerequisite for every latent method as
+   well as for a process reward model. Highest value per hour of anything here.
+3. **Frozen-backbone latent probe on the search families only** — knights, sat,
+   zebra, graph, where §1 and §5 both predict the win, with the token model
+   intact underneath as the fallback. If latent reasoning cannot beat token CoT
+   there, it will not on modpow.
+4. **Latent-GRPO** only once a latent model exists to initialise from; it is a
+   post-training method, not a from-scratch one.
+
+The ordering is not conservatism. Steps 1 and 2 produce the evidence and the data
+that steps 3 and 4 consume, and each is independently useful if the latent track
+is abandoned — the reward curves settle the hypernetwork question either way, and
+generator solution traces give a process reward model regardless of whether a
+single vector is ever fed back into the model.
