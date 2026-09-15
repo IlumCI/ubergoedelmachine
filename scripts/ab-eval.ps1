@@ -54,6 +54,21 @@
   LM Studio and Ollama differ on the sampling knobs the harness does not pin
   (top_k, top_p, min_p), so a progress file half-filled by each measures the
   backend as much as the weights. Use a fresh -Tag when you change hosts.
+
+.PARAMETER Shards
+  Run N reason_eval workers concurrently over interleaved slices of the items,
+  then merge. reason_eval is one request deep, so a single run leaves a serving
+  GPU mostly idle no matter how large it is - decode for one stream is bound by
+  memory bandwidth, and the weights are shared across a batch. Four shards is
+  worth more than four times the silicon, and costs less.
+
+  Remote only: parallel streams need the server to hold N contexts at once,
+  which a 4 GB laptop card cannot do. Set OLLAMA_NUM_PARALLEL on the server to
+  at least this value, or the requests queue and nothing is gained.
+
+  Keep Shards IDENTICAL across the models being compared. Batched kernels are
+  not bit-identical to single-stream ones, so a pair split across two batching
+  regimes has one more difference in it than the weights.
 #>
 param(
     [int]$Limit = 60,
@@ -63,7 +78,8 @@ param(
     [string]$Dataset = "",
     [string[]]$Models = @("base-q4km","student-v1-q4km"),
     [switch]$NoStream,
-    [string]$RemoteUrl = ""
+    [string]$RemoteUrl = "",
+    [int]$Shards = 1
 )
 $ErrorActionPreference = "Continue"
 $LMS  = "C:\Users\ilum\.lmstudio\bin\lms.exe"
@@ -75,6 +91,12 @@ $out  = "$env:USERPROFILE\models\reasoning"
 # model key no server has, every item fails, and the run looks like a broken
 # tunnel rather than a broken argument. Split here so both call styles agree.
 $Models = $Models | ForEach-Object { $_ -split ',' } | Where-Object { $_.Trim() } | ForEach-Object { $_.Trim() }
+
+if ($Shards -gt 1 -and -not $RemoteUrl) {
+    Write-Host "-Shards needs -RemoteUrl: N concurrent streams need a server holding N contexts," -ForegroundColor Red
+    Write-Host "which the local 4 GB card cannot do. Serve from Colab instead." -ForegroundColor Red
+    exit 1
+}
 
 if ($RemoteUrl) {
     if ($Models.Count -gt 1) {
@@ -126,11 +148,76 @@ foreach ($m in $Models) {
     }
     $env:RESUME = "$out\ab$Tag-$m.progress.jsonl"
     $sw = [Diagnostics.Stopwatch]::StartNew()
-    # Transcript rather than Tee-Object: a pipeline buffers by line, which would
-    # hold back token-level output until a newline arrives.
-    Start-Transcript -Path "$out\ab$Tag-$m.log" -Append | Out-Null
-    cargo run -q -p samaritan-run --example reason_eval
-    Stop-Transcript | Out-Null
+
+    if ($Shards -gt 1) {
+        # reason_eval is strictly sequential, so throughput is one stream deep no
+        # matter how big the GPU is. A server holding a 4B model runs several
+        # streams at nearly the same per-stream speed - the weights are shared
+        # across the batch - so N shards is a far bigger lever than faster
+        # silicon. Split the items, run N processes, concatenate the results.
+        $shardDir = Join-Path $out "shards$Tag-$m"
+        New-Item -ItemType Directory -Force -Path $shardDir | Out-Null
+        $Utf8NoBom = New-Object System.Text.UTF8Encoding $false
+
+        # Build once. N concurrent `cargo run`s would serialise on the build lock
+        # and race to write the same exe.
+        cargo build -q -p samaritan-run --example reason_eval
+        if ($LASTEXITCODE -ne 0) { Write-Host "build failed" -ForegroundColor Red; exit 1 }
+        $exe = Join-Path $repo "target\debug\examples\reason_eval.exe"
+
+        $rows = Get-Content $Dataset | Where-Object { $_.Trim() } | Select-Object -First $Limit
+        Write-Host "sharding $($rows.Count) items across $Shards workers" -ForegroundColor Cyan
+
+        $jobs = @()
+        for ($s = 0; $s -lt $Shards; $s++) {
+            $slice = @(); for ($j = $s; $j -lt $rows.Count; $j += $Shards) { $slice += $rows[$j] }
+            if (-not $slice) { continue }
+            $dsPath = Join-Path $shardDir "items-$s.jsonl"
+            # NOT Set-Content -Encoding utf8: on PowerShell 5.1 that writes a BOM,
+            # and three stray bytes before the first '{' make every shard fail to
+            # parse as "expected value at line 1 column 1".
+            [System.IO.File]::WriteAllLines($dsPath, $slice, $Utf8NoBom)
+            $jobs += Start-Job -ScriptBlock {
+                param($exe, $repo, $ds, $resume, $url, $model, $maxTok, $seed)
+                Set-Location $repo
+                $env:SAMARITAN_URL = $url; $env:SAMARITAN_MODEL = $model
+                $env:DATASET = $ds; $env:RESUME = $resume
+                $env:LIMIT = "100000"; $env:MAX_TOKENS = $maxTok
+                if ($seed) { $env:SEED = $seed }
+                Remove-Item Env:SAMARITAN_STREAM -ErrorAction SilentlyContinue
+                & $exe 2>&1
+            } -ArgumentList $exe, $repo, $dsPath, (Join-Path $shardDir "progress-$s.jsonl"),
+                            $env:SAMARITAN_URL, $env:SAMARITAN_MODEL, "$MaxTokens", $env:SEED
+        }
+
+        $done = 0
+        while ($jobs | Where-Object { $_.State -eq 'Running' }) {
+            Start-Sleep -Seconds 20
+            $n = 0
+            Get-ChildItem "$shardDir\progress-*.jsonl" -ErrorAction SilentlyContinue |
+                ForEach-Object { $n += @(Get-Content $_ | Where-Object { $_.Trim() }).Count }
+            if ($n -ne $done) {
+                $done = $n
+                Write-Host ("  {0}/{1} items  ({2:N1} min)" -f $done, $rows.Count, $sw.Elapsed.TotalMinutes)
+            }
+        }
+        $jobs | ForEach-Object { Receive-Job $_ | Out-File -Append -Encoding utf8 "$out\ab$Tag-$m.log" }
+        $jobs | Remove-Job
+
+        # Merge into the single progress file the analysis expects - again BOM-free,
+        # so downstream readers see JSON on line 1 rather than three stray bytes.
+        $merged = @(Get-ChildItem "$shardDir\progress-*.jsonl" -ErrorAction SilentlyContinue |
+            ForEach-Object { Get-Content $_ | Where-Object { $_.Trim() } })
+        [System.IO.File]::WriteAllLines($env:RESUME, $merged, $Utf8NoBom)
+        $total = @(Get-Content $env:RESUME | Where-Object { $_.Trim() }).Count
+        Write-Host "merged $total items -> $env:RESUME" -ForegroundColor Green
+    } else {
+        # Transcript rather than Tee-Object: a pipeline buffers by line, which would
+        # hold back token-level output until a newline arrives.
+        Start-Transcript -Path "$out\ab$Tag-$m.log" -Append | Out-Null
+        cargo run -q -p samaritan-run --example reason_eval
+        Stop-Transcript | Out-Null
+    }
     $sw.Stop()
     Write-Host ("[$m] wall clock: {0:N1} min" -f $sw.Elapsed.TotalMinutes) -ForegroundColor Yellow
 }
