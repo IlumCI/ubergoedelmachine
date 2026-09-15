@@ -22,6 +22,13 @@
   Per-item generation budget. Must stay under the served context (4096) with room
   for the prompt.
 
+.PARAMETER Dataset
+  Reasoning JSONL to evaluate. Defaults to the W7 generated held-out set.
+
+.PARAMETER Models
+  Which model keys to run. Pass a single one to probe just that model - e.g. to
+  ask whether the baseline's cap-failures are rescued by a bigger budget.
+
 .PARAMETER Ctx
   Served context window. Must exceed MaxTokens plus the prompt, or the model is
   capped by the window instead of the budget you set.
@@ -41,6 +48,8 @@ param(
     [int]$MaxTokens = 3000,
     [int]$Ctx = 4096,
     [string]$Tag = "",
+    [string]$Dataset = "",
+    [string[]]$Models = @("base-q4km","student-v1-q4km"),
     [switch]$NoStream
 )
 $ErrorActionPreference = "Continue"
@@ -51,14 +60,15 @@ $out  = "$env:USERPROFILE\models\reasoning"
 & $LMS server start --port 1234 | Out-Null
 $env:SAMARITAN_URL   = "http://127.0.0.1:1234/v1"
 $env:SAMARITAN_MODEL = "samaritan-playout"
-$env:DATASET   = "$out\generated-d2-s777.jsonl"
+if (-not $Dataset) { $Dataset = "$out\generated-d2-s777.jsonl" }
+$env:DATASET   = $Dataset
 $env:LIMIT     = "$Limit"
 $env:MAX_TOKENS = "$MaxTokens"
 if ($NoStream) { Remove-Item Env:SAMARITAN_STREAM -ErrorAction SilentlyContinue }
 else           { $env:SAMARITAN_STREAM = "1" }
 Set-Location $repo
 
-foreach ($m in @("base-q4km","student-v1-q4km")) {
+foreach ($m in $Models) {
     Write-Host "`n=================== $m ===================" -ForegroundColor Cyan
     & $LMS unload --all 2>$null | Out-Null
     Start-Sleep -Seconds 3
