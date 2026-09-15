@@ -368,7 +368,11 @@ fn solutions(stmts: &[Stmt], n: usize) -> Vec<Vec<bool>> {
 
 fn make_knights(rng: &mut SplitMix64, d: u64) -> (String, String) {
     let n = ((2 + d) as usize).min(7);
-    loop {
+    // Bounded, because an unsatisfiable configuration must fail loudly rather
+    // than spin: this loop hung forever at d1 until the count statement below was
+    // made unconditional. At the observed ~20-38% hit rate, exhausting 500 draws
+    // is effectively impossible, so this is a tripwire, not a code path.
+    for _attempt in 0..500 {
         // A hidden assignment, then statements each speaker would actually make
         // under it (knights speak truth, knaves lie) — so at least one solution
         // exists; the uniqueness check below does the rest.
@@ -376,7 +380,12 @@ fn make_knights(rng: &mut SplitMix64, d: u64) -> (String, String) {
         let true_count = assign.iter().filter(|&&k| k).count();
         let mut stmts: Vec<Stmt> = Vec::new();
         for speaker in 0..n {
-            let counting = d >= 2 && speaker == n - 1;
+            // ALWAYS give the last speaker a count statement. Accusations alone are
+            // complement-symmetric - if an assignment satisfies them, so does the
+            // one with every knight and knave flipped - so solutions come in pairs
+            // and "exactly one solution" is unreachable. A count is the asymmetry
+            // that makes uniqueness possible at all.
+            let counting = speaker == n - 1;
             if counting {
                 let count = if assign[speaker] {
                     true_count
@@ -438,6 +447,9 @@ fn make_knights(rng: &mut SplitMix64, d: u64) -> (String, String) {
         let kind = if sol[who] { "knight" } else { "knave" };
         return (text, kind.to_string());
     }
+    panic!(
+        "knights: no uniquely-solvable puzzle in 500 draws at difficulty {d} (n={n}).          A statement mix that cannot break complement symmetry will do this."
+    );
 }
 
 // ---------------------------------------------------------------- interface --
@@ -601,7 +613,13 @@ mod tests {
         // The real contract: the JSONL the example emits must load through
         // samaritan_corpus and the computed gold must satisfy the harness's own
         // grader verbatim — no judge, no formatting drift.
-        let problems = generate_set(30, &Family::all(), 2, 42);
+        // Every difficulty, not just the easy one: a family whose gold stops
+        // grading at d4 (a wider modulus, a longer chain) would silently produce
+        // an unscoreable eval, and the cost shows up as a wasted GPU run.
+        let mut problems = Vec::new();
+        for d in 1..=5 {
+            problems.extend(generate_set(15, &Family::all(), d, 40 + d));
+        }
         let jsonl: String = problems
             .iter()
             .map(|p| {
@@ -620,7 +638,7 @@ mod tests {
         let corpus =
             samaritan_corpus::load_reasoning(&jsonl, "generated", true, samaritan_corpus::Split::Train)
                 .expect("generated JSONL must load");
-        assert_eq!(corpus.tasks.len(), 30);
+        assert_eq!(corpus.tasks.len(), 75);
         assert!(corpus.trainable);
         for (task, p) in corpus.tasks.iter().zip(&problems) {
             assert_eq!(
