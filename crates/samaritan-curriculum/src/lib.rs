@@ -65,11 +65,38 @@ pub enum Family {
     /// Knights-and-knaves with a brute-force **uniqueness check**: only puzzles
     /// with exactly one consistent assignment are emitted.
     Knights,
+    /// How many strings of a given length a DFA accepts — the gold is a DP over
+    /// the transition table, so the model must reason about the automaton rather
+    /// than trace one string. Counting, not deciding: a yes/no acceptance
+    /// question is 50% guessable and teaches nothing to a sampler.
+    Automata,
+    /// Shortest-path or minimum-spanning-tree weight on a small weighted graph.
+    /// Gold by running the algorithm the question is about.
+    Graph,
+    /// Exact evaluation of a divide-and-conquer recurrence T(n)=a·T(n/b)+f(n).
+    /// Asking for the closed value rather than the asymptotic class keeps the
+    /// answer an unguessable integer while still requiring the recursion be
+    /// followed correctly.
+    DivideConquer,
+    /// #SAT: how many assignments satisfy a CNF formula. Counting again, for the
+    /// same reason — and the gold is exhaustive, so it is a proof, not an
+    /// estimate.
+    Sat,
 }
 
 impl Family {
     pub fn all() -> Vec<Family> {
-        vec![Family::ModPow, Family::Crt, Family::Recurrence, Family::Word, Family::Knights]
+        vec![
+            Family::ModPow,
+            Family::Crt,
+            Family::Recurrence,
+            Family::Word,
+            Family::Knights,
+            Family::Automata,
+            Family::Graph,
+            Family::DivideConquer,
+            Family::Sat,
+        ]
     }
 
     pub fn name(self) -> &'static str {
@@ -79,6 +106,10 @@ impl Family {
             Family::Recurrence => "recurrence",
             Family::Word => "word",
             Family::Knights => "knights",
+            Family::Automata => "automata",
+            Family::Graph => "graph",
+            Family::DivideConquer => "divideconquer",
+            Family::Sat => "sat",
         }
     }
 
@@ -89,13 +120,18 @@ impl Family {
             "recurrence" => Some(Family::Recurrence),
             "word" => Some(Family::Word),
             "knights" => Some(Family::Knights),
+            "automata" => Some(Family::Automata),
+            "graph" => Some(Family::Graph),
+            "divideconquer" | "dc" => Some(Family::DivideConquer),
+            "sat" => Some(Family::Sat),
             _ => None,
         }
     }
 
     fn domain(self) -> &'static str {
         match self {
-            Family::Knights => "logic",
+            Family::Knights | Family::Sat => "logic",
+            Family::Automata | Family::Graph | Family::DivideConquer => "cs",
             _ => "math",
         }
     }
@@ -452,6 +488,289 @@ fn make_knights(rng: &mut SplitMix64, d: u64) -> (String, String) {
     );
 }
 
+// ------------------------------------------------- theoretical CS families ----
+// Everything below computes its gold by RUNNING the thing the question asks
+// about: a DP over the transition table, Dijkstra, the recursion itself,
+// exhaustive assignment enumeration. Same contract the arithmetic families hold
+// to, extended to a domain where answers are still decidable.
+//
+// All four ask for a COUNT or a WEIGHT rather than a yes/no. A decision question
+// ("does this DFA accept?", "is this satisfiable?") is 50% guessable, which under
+// a sampling-based RL objective rewards coin-flipping instead of reasoning.
+
+/// Strings of length `len` over {a,b} accepted by a DFA, by dynamic programming
+/// over the state distribution - the same recurrence the model has to find.
+fn dfa_count_accepted(delta: &[[usize; 2]], accepting: &[bool], len: u64) -> u64 {
+    let n = delta.len();
+    let mut counts = vec![0u64; n];
+    counts[0] = 1; // start state 0
+    for _ in 0..len {
+        let mut next = vec![0u64; n];
+        for (st, &c) in counts.iter().enumerate() {
+            if c == 0 {
+                continue;
+            }
+            for sym in 0..2 {
+                next[delta[st][sym]] += c;
+            }
+        }
+        counts = next;
+    }
+    counts.iter().enumerate().filter(|(st, _)| accepting[*st]).map(|(_, c)| *c).sum()
+}
+
+fn make_automata(rng: &mut SplitMix64, d: u64) -> (String, String) {
+    let n = (2 + d).min(6) as usize;
+    let len = match d {
+        1 => rng.range(3, 5),
+        2 => rng.range(5, 8),
+        3 => rng.range(8, 12),
+        4 => rng.range(12, 18),
+        _ => rng.range(18, 25),
+    };
+    for _attempt in 0..500 {
+        let delta: Vec<[usize; 2]> = (0..n)
+            .map(|_| [rng.range(0, n as u64 - 1) as usize, rng.range(0, n as u64 - 1) as usize])
+            .collect();
+        let accepting: Vec<bool> = (0..n).map(|_| rng.chance(40)).collect();
+        // Reject the degenerate extremes: an automaton accepting everything or
+        // nothing is answered without reading the transition table at all.
+        if accepting.iter().all(|a| !a) || accepting.iter().all(|a| *a) {
+            continue;
+        }
+        let gold = dfa_count_accepted(&delta, &accepting, len);
+        if gold == 0 || gold == 1u64 << len {
+            continue;
+        }
+        let mut q =
+            String::from("A deterministic finite automaton over the alphabet {a, b} has states ");
+        q.push_str(&(0..n).map(|i| format!("q{i}")).collect::<Vec<_>>().join(", "));
+        q.push_str(". The start state is q0. Transitions:");
+        for (i, row) in delta.iter().enumerate() {
+            q.push_str(&format!(
+                " from q{i} on a go to q{}, on b go to q{};",
+                row[0], row[1]
+            ));
+        }
+        let acc: Vec<String> = (0..n).filter(|i| accepting[*i]).map(|i| format!("q{i}")).collect();
+        q.push_str(&format!(
+            " The accepting states are {}. How many distinct strings of length {len} over the \
+             alphabet {{a, b}} does this automaton accept?",
+            acc.join(", ")
+        ));
+        return (q, gold.to_string());
+    }
+    panic!("automata: no non-degenerate DFA in 500 draws at difficulty {d}");
+}
+
+/// Dijkstra over a small graph. None when the target is unreachable, which the
+/// caller regenerates rather than asks about.
+fn shortest_path(n: usize, edges: &[(usize, usize, u64)], from: usize, to: usize) -> Option<u64> {
+    let mut dist = vec![u64::MAX; n];
+    dist[from] = 0;
+    let mut done = vec![false; n];
+    for _ in 0..n {
+        let mut best = usize::MAX;
+        for v in 0..n {
+            if !done[v] && dist[v] != u64::MAX && (best == usize::MAX || dist[v] < dist[best]) {
+                best = v;
+            }
+        }
+        if best == usize::MAX {
+            break;
+        }
+        done[best] = true;
+        for &(u, v, w) in edges {
+            for (a, b) in [(u, v), (v, u)] {
+                if a == best && dist[best] + w < dist[b] {
+                    dist[b] = dist[best] + w;
+                }
+            }
+        }
+    }
+    (dist[to] != u64::MAX).then_some(dist[to])
+}
+
+/// Kruskal with union-find: total weight of a minimum spanning tree, or None if
+/// the graph is disconnected.
+fn mst_weight(n: usize, edges: &[(usize, usize, u64)]) -> Option<u64> {
+    fn find(parent: &mut Vec<usize>, x: usize) -> usize {
+        if parent[x] != x {
+            let r = find(parent, parent[x]);
+            parent[x] = r;
+        }
+        parent[x]
+    }
+    let mut parent: Vec<usize> = (0..n).collect();
+    let mut sorted = edges.to_vec();
+    sorted.sort_by_key(|e| e.2);
+    let (mut total, mut used) = (0u64, 0usize);
+    for (u, v, w) in sorted {
+        let (ru, rv) = (find(&mut parent, u), find(&mut parent, v));
+        if ru != rv {
+            parent[ru] = rv;
+            total += w;
+            used += 1;
+        }
+    }
+    (used == n - 1).then_some(total)
+}
+
+fn make_graph(rng: &mut SplitMix64, d: u64) -> (String, String) {
+    let n = (4 + d).min(8) as usize;
+    let max_w = 5 + 5 * d;
+    for _attempt in 0..500 {
+        let mut edges: Vec<(usize, usize, u64)> = Vec::new();
+        for u in 0..n {
+            for v in (u + 1)..n {
+                if rng.chance(55) {
+                    edges.push((u, v, rng.range(1, max_w)));
+                }
+            }
+        }
+        if edges.len() < n {
+            continue;
+        }
+        let ask_mst = rng.chance(50);
+        let gold = if ask_mst {
+            mst_weight(n, &edges)
+        } else {
+            shortest_path(n, &edges, 0, n - 1)
+        };
+        let Some(gold) = gold else { continue };
+        let mut q = format!(
+            "An undirected weighted graph has {n} vertices labelled v0 to v{}. Its edges are:",
+            n - 1
+        );
+        for (u, v, w) in &edges {
+            q.push_str(&format!(" v{u}-v{v} (weight {w}),"));
+        }
+        q.pop();
+        q.push('.');
+        if ask_mst {
+            q.push_str(" What is the total weight of a minimum spanning tree of this graph?");
+        } else {
+            q.push_str(&format!(
+                " What is the weight of the shortest path from v0 to v{}?",
+                n - 1
+            ));
+        }
+        return (q, gold.to_string());
+    }
+    panic!("graph: no connected graph in 500 draws at difficulty {d}");
+}
+
+/// T(n) evaluated exactly: T(1)=base, T(n)=a*T(n/b)+c*n^e at n=b^k. Iterated from
+/// the base case up, so the recursion itself produces the gold.
+fn divide_conquer_value(a: u64, b: u64, c: u64, e: u32, base: u64, k: u32) -> u64 {
+    let mut t = base;
+    for i in 1..=k {
+        let n = b.pow(i);
+        t = a * t + c * n.pow(e);
+    }
+    t
+}
+
+fn make_divide_conquer(rng: &mut SplitMix64, d: u64) -> (String, String) {
+    let b = *rng.pick(&[2u64, 2, 3]);
+    let a = match d {
+        1 | 2 => rng.range(1, 3),
+        3 => rng.range(2, 5),
+        _ => rng.range(2, 8),
+    };
+    let c = rng.range(1, 2 + d);
+    let e = if d >= 3 && rng.chance(40) { 2u32 } else { 1u32 };
+    let base = rng.range(1, 5);
+    let k = match d {
+        1 => 3u32,
+        2 => 4,
+        3 => 5,
+        4 => 6,
+        _ => 7,
+    };
+    let n = b.pow(k);
+    let gold = divide_conquer_value(a, b, c, e, base, k);
+    let fterm = if e == 1 { "n".to_string() } else { format!("n^{e}") };
+    let cterm = if c == 1 { fterm.clone() } else { format!("{c}*{fterm}") };
+    let q = format!(
+        "A divide-and-conquer algorithm has running time T(n) = {a}*T(n/{b}) + {cterm}, with \
+         T(1) = {base}. The recursion applies whenever n > 1 and n is a power of {b}. What is \
+         the exact value of T({n})?"
+    );
+    (q, gold.to_string())
+}
+
+/// #SAT by exhaustive enumeration - the count IS the proof, which is why the
+/// question asks for it rather than for a yes/no.
+fn sat_count(vars: usize, clauses: &[Vec<(usize, bool)>]) -> u64 {
+    let mut count = 0u64;
+    for bits in 0..(1u32 << vars) {
+        let assign: Vec<bool> = (0..vars).map(|i| bits >> i & 1 == 1).collect();
+        if clauses.iter().all(|cl| cl.iter().any(|&(v, pos)| assign[v] == pos)) {
+            count += 1;
+        }
+    }
+    count
+}
+
+fn make_sat(rng: &mut SplitMix64, d: u64) -> (String, String) {
+    let vars = (3 + d).min(7) as usize;
+    let n_clauses = (3 + 2 * d).min(12) as usize;
+    let total = 1u64 << vars;
+    // Bounded for the same reason knights is: an unsatisfiable filter must fail
+    // loudly, not spin. The first version rejected `gold >= total/2`, which at d1
+    // (4 vars, 4 clauses) was impossible to pass: a 3-literal clause over
+    // distinct variables rules out at most total/8 assignments, so four clauses
+    // leave at least total/2 and every draw was rejected forever.
+    for _attempt in 0..500 {
+        let mut clauses: Vec<Vec<(usize, bool)>> = Vec::new();
+        for _ in 0..n_clauses {
+            let mut lits: Vec<(usize, bool)> = Vec::new();
+            while lits.len() < 3 {
+                let v = rng.range(0, vars as u64 - 1) as usize;
+                if lits.iter().any(|(x, _)| *x == v) {
+                    continue;
+                }
+                lits.push((v, rng.chance(50)));
+            }
+            clauses.push(lits);
+        }
+        let gold = sat_count(vars, &clauses);
+        // Skip only the genuinely degenerate ends: unsatisfiable, or so loose
+        // that three quarters of assignments work. The threshold has to be
+        // REACHABLE given how much a clause can constrain - see the note above.
+        if gold == 0 || gold * 4 >= total * 3 {
+            continue;
+        }
+        let names: Vec<String> = (0..vars).map(|i| format!("x{i}")).collect();
+        let body = clauses
+            .iter()
+            .map(|cl| {
+                let lits = cl
+                    .iter()
+                    .map(|&(v, pos)| {
+                        if pos {
+                            names[v].clone()
+                        } else {
+                            format!("NOT {}", names[v])
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" OR ");
+                format!("({lits})")
+            })
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let q = format!(
+            "Consider the boolean formula over variables {}: {body}. How many of the {total} \
+             possible truth assignments satisfy it?",
+            names.join(", ")
+        );
+        return (q, gold.to_string());
+    }
+    panic!("sat: no non-degenerate formula in 500 draws at difficulty {d} (vars={vars})");
+}
+
 // ---------------------------------------------------------------- interface --
 
 /// Generate one problem of `family` at `difficulty` (clamped to 1..=5).
@@ -463,6 +782,10 @@ pub fn generate(family: Family, difficulty: u64, rng: &mut SplitMix64) -> (Strin
         Family::Recurrence => make_recurrence(rng, d),
         Family::Word => make_word(rng, d),
         Family::Knights => make_knights(rng, d),
+        Family::Automata => make_automata(rng, d),
+        Family::Graph => make_graph(rng, d),
+        Family::DivideConquer => make_divide_conquer(rng, d),
+        Family::Sat => make_sat(rng, d),
     }
 }
 
@@ -648,6 +971,207 @@ mod tests {
                 p.question,
                 p.answer
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod cs_tests {
+    use super::*;
+
+    /// The DP is only trustworthy if it agrees with actually running every
+    /// string through the automaton. Small `len` so the brute force is exact.
+    #[test]
+    fn dfa_dp_count_matches_brute_force_simulation() {
+        let mut rng = SplitMix64::new(11);
+        for _ in 0..40 {
+            let n = 4usize;
+            let delta: Vec<[usize; 2]> = (0..n)
+                .map(|_| [rng.range(0, 3) as usize, rng.range(0, 3) as usize])
+                .collect();
+            let accepting: Vec<bool> = (0..n).map(|_| rng.chance(50)).collect();
+            let len = 8u64;
+            let dp = dfa_count_accepted(&delta, &accepting, len);
+            let mut brute = 0u64;
+            for bits in 0..(1u32 << len) {
+                let mut st = 0usize;
+                for i in 0..len {
+                    let sym = (bits >> i & 1) as usize;
+                    st = delta[st][sym];
+                }
+                if accepting[st] {
+                    brute += 1;
+                }
+            }
+            assert_eq!(dp, brute, "DP disagreed with simulation");
+        }
+    }
+
+    /// Dijkstra against exhaustive search over every simple path.
+    #[test]
+    fn shortest_path_matches_exhaustive_search() {
+        fn best(
+            n: usize,
+            edges: &[(usize, usize, u64)],
+            at: usize,
+            to: usize,
+            seen: &mut Vec<bool>,
+            acc: u64,
+        ) -> Option<u64> {
+            if at == to {
+                return Some(acc);
+            }
+            let mut out: Option<u64> = None;
+            for &(u, v, w) in edges {
+                for (a, b) in [(u, v), (v, u)] {
+                    if a == at && !seen[b] {
+                        seen[b] = true;
+                        if let Some(c) = best(n, edges, b, to, seen, acc + w) {
+                            out = Some(out.map_or(c, |o: u64| o.min(c)));
+                        }
+                        seen[b] = false;
+                    }
+                }
+            }
+            out
+        }
+        let mut rng = SplitMix64::new(23);
+        for _ in 0..40 {
+            let n = 5usize;
+            let mut edges = Vec::new();
+            for u in 0..n {
+                for v in (u + 1)..n {
+                    if rng.chance(60) {
+                        edges.push((u, v, rng.range(1, 9)));
+                    }
+                }
+            }
+            let mut seen = vec![false; n];
+            seen[0] = true;
+            let brute = best(n, &edges, 0, n - 1, &mut seen, 0);
+            assert_eq!(shortest_path(n, &edges, 0, n - 1), brute);
+        }
+    }
+
+    /// Kruskal against Prim: two different algorithms must agree on the weight.
+    #[test]
+    fn mst_weight_matches_prim() {
+        fn prim(n: usize, edges: &[(usize, usize, u64)]) -> Option<u64> {
+            let mut inside = vec![false; n];
+            inside[0] = true;
+            let (mut total, mut added) = (0u64, 0usize);
+            while added < n - 1 {
+                let mut best: Option<(u64, usize)> = None;
+                for &(u, v, w) in edges {
+                    for (a, b) in [(u, v), (v, u)] {
+                        if inside[a] && !inside[b] && best.map_or(true, |(bw, _)| w < bw) {
+                            best = Some((w, b));
+                        }
+                    }
+                }
+                let (w, b) = best?;
+                inside[b] = true;
+                total += w;
+                added += 1;
+            }
+            Some(total)
+        }
+        let mut rng = SplitMix64::new(31);
+        for _ in 0..40 {
+            let n = 6usize;
+            let mut edges = Vec::new();
+            for u in 0..n {
+                for v in (u + 1)..n {
+                    if rng.chance(55) {
+                        edges.push((u, v, rng.range(1, 12)));
+                    }
+                }
+            }
+            assert_eq!(mst_weight(n, &edges), prim(n, &edges), "Kruskal != Prim");
+        }
+    }
+
+    /// The iterative evaluation must equal the recursion it claims to evaluate.
+    #[test]
+    fn divide_conquer_matches_direct_recursion() {
+        fn rec(a: u64, b: u64, c: u64, e: u32, base: u64, n: u64) -> u64 {
+            if n <= 1 { base } else { a * rec(a, b, c, e, base, n / b) + c * n.pow(e) }
+        }
+        for (a, b, c, e, base, k) in
+            [(2u64, 2u64, 1u64, 1u32, 1u64, 5u32), (3, 2, 2, 1, 4, 6), (2, 3, 1, 2, 2, 4)]
+        {
+            let n = b.pow(k);
+            assert_eq!(
+                divide_conquer_value(a, b, c, e, base, k),
+                rec(a, b, c, e, base, n),
+                "a={a} b={b} c={c} e={e} n={n}"
+            );
+        }
+    }
+
+    /// Every counted assignment must actually satisfy, and every satisfying one
+    /// must be counted - checked by re-deriving the set independently.
+    #[test]
+    fn sat_count_agrees_with_an_independent_pass() {
+        let mut rng = SplitMix64::new(43);
+        for _ in 0..40 {
+            let vars = 5usize;
+            let mut clauses: Vec<Vec<(usize, bool)>> = Vec::new();
+            for _ in 0..6 {
+                let mut lits = Vec::new();
+                while lits.len() < 3 {
+                    let v = rng.range(0, vars as u64 - 1) as usize;
+                    if lits.iter().any(|(x, _): &(usize, bool)| *x == v) {
+                        continue;
+                    }
+                    lits.push((v, rng.chance(50)));
+                }
+                clauses.push(lits);
+            }
+            let counted = sat_count(vars, &clauses);
+            let mut independent = 0u64;
+            for bits in 0..(1u32 << vars) {
+                let a: Vec<bool> = (0..vars).map(|i| (bits >> i) & 1 == 1).collect();
+                let mut all = true;
+                for cl in &clauses {
+                    let mut any = false;
+                    for &(v, pos) in cl {
+                        if (a[v] && pos) || (!a[v] && !pos) {
+                            any = true;
+                        }
+                    }
+                    if !any {
+                        all = false;
+                    }
+                }
+                if all {
+                    independent += 1;
+                }
+            }
+            assert_eq!(counted, independent);
+        }
+    }
+
+    /// The generators must terminate and produce gradeable golds at every
+    /// difficulty - the d1 knights hang is why this is asserted, not assumed.
+    #[test]
+    fn cs_families_generate_and_grade_at_every_difficulty() {
+        let fams =
+            [Family::Automata, Family::Graph, Family::DivideConquer, Family::Sat];
+        for d in 1..=5u64 {
+            let mut rng = SplitMix64::new(900 + d);
+            for f in fams {
+                for _ in 0..6 {
+                    let (q, a) = generate(f, d, &mut rng);
+                    assert!(!q.is_empty(), "{} d{d}: empty question", f.name());
+                    let n: u64 = a.parse().unwrap_or_else(|_| {
+                        panic!("{} d{d}: gold {a:?} is not an integer", f.name())
+                    });
+                    // A gold of zero would mean a degenerate instance slipped the
+                    // filters; these families all count something non-empty.
+                    assert!(n > 0, "{} d{d}: gold was 0 for {q}", f.name());
+                }
+            }
         }
     }
 }
