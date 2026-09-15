@@ -618,3 +618,84 @@ impl TestPatterns {
         self.file_stems.iter().any(|s| stem.ends_with(s))
     }
 }
+
+// ------------------------------------------------- answer extraction ----
+/// Lift the final answer and stated confidence out of a reasoning reply.
+///
+/// Drops a thinking block, prefers an explicit `Answer:` marker, and falls back
+/// to the last non-empty line — because a model that ignores the format still
+/// usually puts its answer last. Confidence defaults to 0.5 (an honest "unsure")
+/// when unstated, never to a flattering high value.
+pub fn extract_answer(content: &str) -> (String, f64) {
+    // Everything after the last </think> is the answer proper; if there is no
+    // think block, the whole reply is. Confidence is scanned over the whole
+    // reply, since a model sometimes states it inside the thinking.
+    let body = match content.rfind("</think>") {
+        Some(i) => &content[i + "</think>".len()..],
+        None => content,
+    };
+    let confidence = parse_confidence(content).unwrap_or(0.5);
+    // Prefer the answer from the post-think body; fall back to the whole reply
+    // for a model that answered inside its thinking and emitted only a
+    // confidence line after.
+    let answer = answer_from(body).or_else(|| answer_from(content)).unwrap_or_default();
+    (answer, confidence)
+}
+
+/// The final answer in a block of text, or `None` if there is nothing usable.
+///
+/// Handles the shapes a chat model actually produces: `Answer: X` inline,
+/// `Answer:` with the value on the next line, and no marker at all (take the
+/// last real line). It never returns the `Confidence:` line — the bug the first
+/// live run exposed, where a bare `Answer:` sent the fallback onto the trailing
+/// confidence line and graded a correct answer as wrong.
+fn answer_from(text: &str) -> Option<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    for (i, line) in lines.iter().enumerate() {
+        let lower = line.to_lowercase();
+        let pos = lower.find("answer:").or_else(|| lower.find("final answer:"));
+        if let Some(pos) = pos {
+            let after = lower[pos..].find(':').map(|c| pos + c + 1).unwrap_or(pos);
+            let inline = line[after..].trim();
+            if !inline.is_empty() {
+                return Some(inline.to_string());
+            }
+            // `Answer:` with the value on a following line.
+            for next in &lines[i + 1..] {
+                let t = next.trim();
+                if !t.is_empty() && !is_confidence_line(t) {
+                    return Some(t.to_string());
+                }
+            }
+        }
+    }
+    // No marker: the last non-empty line that is not the confidence line.
+    lines
+        .iter()
+        .rev()
+        .map(|l| l.trim())
+        .find(|l| !l.is_empty() && !is_confidence_line(l))
+        .map(|s| s.to_string())
+}
+
+fn is_confidence_line(line: &str) -> bool {
+    line.to_lowercase().trim_start_matches(['*', '#', '-', ' ']).starts_with("confidence:")
+}
+
+fn parse_confidence(text: &str) -> Option<f64> {
+    // The last confidence line wins.
+    let mut value = None;
+    for line in text.lines() {
+        let lower = line.to_lowercase();
+        if let Some(pos) = lower.find("confidence:") {
+            value = Some(line[pos + "confidence:".len()..].trim().to_string());
+        }
+    }
+    let v = value?;
+    // The value may be "0.8", "0.8 (high)", "80%"; take the leading number.
+    let token: String = v.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+    let n: f64 = token.parse().ok()?;
+    // A percentage if it came in as 0-100.
+    let n = if n > 1.0 { n / 100.0 } else { n };
+    Some(n.clamp(0.0, 1.0))
+}

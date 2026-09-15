@@ -1,6 +1,6 @@
 //! Grading as a service, so a non-Rust trainer cannot drift from the oracle.
 //!
-//!     cargo run -q -p samaritan-run --example grade_batch
+//!     cargo run -q --release -p samaritan-corpus --example grade_batch
 //!
 //! Reads JSONL on stdin, writes JSONL on stdout, one line out per line in:
 //!
@@ -23,8 +23,7 @@
 
 use std::io::{BufRead, Write};
 
-use samaritan_corpus::{grade_answer, AnswerKind};
-use samaritan_episode::extract_answer;
+use samaritan_corpus::{extract_answer, grade_answer, AnswerKind};
 
 fn main() {
     let stdin = std::io::stdin();
