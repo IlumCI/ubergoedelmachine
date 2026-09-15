@@ -16,8 +16,9 @@
 //!                or selftrain_export's {solved} records); the observed
 //!                solve-rate nudges DIFFICULTY one step toward the ~55-85%
 //!                band before generating.
-//!   FAMILIES     comma list of modpow,crt,recurrence,word,knights
-//!                (default: all five, round-robin).
+//!   FAMILIES     comma list of modpow,crt,recurrence,word,knights,automata,
+//!                graph,divideconquer,sat,zebra (default: all ten, round-robin
+//!                across math, logic and cs).
 //!   SEED         RNG seed (default 1) — the whole set is re-derivable from it.
 //!   SPLIT_LABEL  train (default) or held_out. A *held-out* generated slice is
 //!                also the cleanest eval there is: same seed discipline, but

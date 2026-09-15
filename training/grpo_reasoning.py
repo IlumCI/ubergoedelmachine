@@ -24,7 +24,13 @@ things this project already has make it runnable:
 Usage:
     python training/grpo_reasoning.py generated-d3.jsonl \
         --base-model Qwen/Qwen3-4B-Thinking-2507 \
-        --output adapters/reasoning-grpo
+        --output adapters/reasoning-grpo \
+        --grader ./target/release/examples/grade_batch
+
+The one setting that decides whether this run learns anything is
+--max-completion: it must exceed the length the model actually needs, or every
+rollout is cut off, every reward is 0, and no group has the spread GRPO's
+advantage is computed from. Measure before choosing it.
 
 The dataset is the reasoning JSONL the rest of the harness reads
 ({question, answer, answer_kind, domain}); gold answers are used ONLY by the
@@ -68,14 +74,32 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output", type=Path, default=Path("adapters/reasoning-grpo"))
     p.add_argument(
         "--grader",
-        default="cargo run -q -p samaritan-run --example grade_batch",
-        help="command reading grading JSONL on stdin, writing verdicts on stdout",
+        default="cargo run -q -p samaritan-corpus --example grade_batch",
+        help="command reading grading JSONL on stdin, writing verdicts on stdout. "
+             "Point this at a PREBUILT binary for training - the default re-enters "
+             "cargo once per batch",
     )
-    p.add_argument("--max-seq-len", type=int, default=4096)
-    p.add_argument("--max-completion", type=int, default=2048,
-                   help="tokens per rollout; the binding cost of GRPO")
-    p.add_argument("--generations", type=int, default=4,
-                   help="rollouts per prompt; GRPO needs >1 to have a group to rank")
+    p.add_argument("--max-seq-len", type=int, default=8192)
+    # Measured, not guessed: on generated d3 the base needs a median of 5,636
+    # tokens to reach an answer, and NONE of the sampled replies finished inside
+    # 2,048. A budget below what the model actually needs truncates every
+    # rollout, so every reward is 0, every group is flat, and GRPO's advantage -
+    # which is purely relative WITHIN a group - is identically zero. That trains
+    # nothing, for hours of paid GPU. Keep this at or above the eval budget.
+    p.add_argument("--max-completion", type=int, default=6144,
+                   help="tokens per rollout; the binding cost of GRPO. Must exceed "
+                        "the model's typical solution length or all rewards are 0")
+    p.add_argument("--generations", type=int, default=8,
+                   help="rollouts per prompt; GRPO needs >1 to have a group to rank, "
+                        "and needs a MIXED group to have any gradient")
+    p.add_argument(
+        "--init-adapter",
+        type=Path,
+        default=None,
+        help="start from an existing LoRA (e.g. the SFT student) instead of the "
+             "raw base - the SFT-then-RL order, and the concise student wastes "
+             "less of the rollout budget",
+    )
     p.add_argument("--steps", type=int, default=200)
     p.add_argument("--lr", type=float, default=5e-6,
                    help="RL wants a far smaller lr than SFT")
@@ -146,6 +170,44 @@ def grade(grader_cmd: str, items: list) -> list:
     return verdicts
 
 
+HEALTH_WINDOW = 10
+
+
+def reward_health(texts: list[str], groups: list[list[bool]], budget: int) -> str:
+    """Say whether the opening groups carry any gradient.
+
+    GRPO's advantage is computed purely from spread WITHIN a group, so a run of
+    unanimous groups is not slow progress - it is no progress, and from the
+    outside it looks exactly like a healthy run. Worth naming while there is
+    still time to stop.
+
+    Spread has to be counted per group, never pooled: ten groups that are each
+    unanimous still give zero gradient even when half came back all-right and
+    half all-wrong, which pooled together would look perfectly mixed.
+    """
+    answered = sum(1 for t in texts if "answer:" in t.lower()) / max(len(texts), 1)
+    mixed = sum(1 for g in groups if len(set(g)) > 1)
+    if mixed:
+        return (
+            f"reward health: {mixed}/{len(groups)} opening groups had spread, "
+            f"{answered:.0%} of rollouts finished with an answer. Training has "
+            "something to learn from."
+        )
+    # Same symptom, opposite fixes - so say which one this is.
+    if answered < 0.5:
+        return (
+            f"*** no gradient: {len(groups)} unanimous groups, and only "
+            f"{answered:.0%} of rollouts emitted an 'Answer:' line. They are "
+            f"being CUT OFF, not getting it wrong. Raise --max-completion above "
+            f"{budget} and restart; training longer will not fix this."
+        )
+    return (
+        f"*** no gradient: {len(groups)} unanimous groups, but {answered:.0%} "
+        "of rollouts finished. The problems are all too easy or all too hard - "
+        "regenerate at a different DIFFICULTY and restart."
+    )
+
+
 def main() -> None:
     args = parse_args()
     rows = load_rows(args.dataset)
@@ -184,24 +246,33 @@ def main() -> None:
             "Use --dry-run to verify the dataset and reward path without a GPU."
         )
 
+    # Starting from an existing adapter continues training THAT adapter; calling
+    # get_peft_model again would stack a second, freshly-random LoRA on top of
+    # it and throw away what the first one learned.
+    source = str(args.init_adapter) if args.init_adapter else args.base_model
+    if args.init_adapter and not args.init_adapter.exists():
+        sys.exit(f"--init-adapter not found: {args.init_adapter}")
     model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=args.base_model,
+        model_name=source,
         max_seq_length=args.max_seq_len,
         load_in_4bit=True,
         dtype=None,
         fast_inference=True,   # rollouts dominate GRPO's cost
     )
-    model = FastLanguageModel.get_peft_model(
-        model,
-        r=args.rank,
-        lora_alpha=args.alpha,
-        lora_dropout=0.0,
-        bias="none",
-        use_gradient_checkpointing="unsloth",
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
-                        "gate_proj", "up_proj", "down_proj"],
-        random_state=args.seed,
-    )
+    if args.init_adapter:
+        print(f"continuing the LoRA in {args.init_adapter} (SFT -> RL)")
+    else:
+        model = FastLanguageModel.get_peft_model(
+            model,
+            r=args.rank,
+            lora_alpha=args.alpha,
+            lora_dropout=0.0,
+            bias="none",
+            use_gradient_checkpointing="unsloth",
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                            "gate_proj", "up_proj", "down_proj"],
+            random_state=args.seed,
+        )
 
     ds = Dataset.from_list([
         {
@@ -215,6 +286,13 @@ def main() -> None:
         for r in rows
     ])
 
+    # GRPO's gradient comes entirely from spread WITHIN a group, so a run where
+    # every group is all-right or all-wrong is not "slow progress" - it is no
+    # progress at all, and it looks exactly like a healthy run from the outside.
+    # Watch the opening batches and say so plainly while there is still time to
+    # stop, rather than burning the whole budget on a flat reward.
+    seen: dict = {"batches": 0, "texts": [], "groups": []}
+
     def reward_correct(completions, gold, kind, **_):
         """1.0 for a verified-correct answer, 0.0 otherwise.
 
@@ -224,6 +302,16 @@ def main() -> None:
         """
         texts = [c[0]["content"] if isinstance(c, list) else c for c in completions]
         verdicts = grade(args.grader, list(zip(texts, gold, kind)))
+
+        seen["batches"] += 1
+        if seen["batches"] <= HEALTH_WINDOW:
+            # With batch_size 1 each call is exactly one prompt's group, which
+            # is the unit spread has to be measured over.
+            seen["texts"] += texts
+            seen["groups"].append(verdicts)
+            if seen["batches"] == HEALTH_WINDOW:
+                msg = reward_health(seen["texts"], seen["groups"], args.max_completion)
+                print(f"\n{msg}\n", file=sys.stderr if msg.startswith("***") else sys.stdout)
         return [1.0 if v else 0.0 for v in verdicts]
 
     trainer = GRPOTrainer(
