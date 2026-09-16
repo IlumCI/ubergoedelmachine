@@ -243,6 +243,18 @@ def parse_args() -> argparse.Namespace:
                    help="rollout temperature; too low collapses the group to one answer")
     p.add_argument("--save-every", type=int, default=25)
     p.add_argument("--seed", type=int, default=1)
+    # Everything below exists so an UNATTENDED run is worth starting. Colab
+    # preempts, GPUs run out of memory, and a flat reward burns hours looking
+    # exactly like a healthy run. None of those should cost the whole session.
+    p.add_argument("--resume", action="store_true",
+                   help="continue from the adapter already in --output, if one is there")
+    p.add_argument("--abort-if-flat", action="store_true", default=True,
+                   help="stop when the opening groups carry no gradient, rather than "
+                        "spending the rest of the run on a zero signal")
+    p.add_argument("--no-abort-if-flat", dest="abort_if_flat", action="store_false")
+    p.add_argument("--min-generations", type=int, default=2,
+                   help="on CUDA OOM the group is halved and retried, down to this; "
+                        "a smaller group still teaches something, a dead run does not")
     p.add_argument("--dry-run", action="store_true",
                    help="verify the dataset and reward path, then stop before the GPU")
     return p.parse_args()
@@ -293,15 +305,24 @@ def main() -> None:
     model = AutoModelForCausalLM.from_pretrained(
         args.base_model, torch_dtype=torch.bfloat16, device_map=device
     )
-    model = get_peft_model(
-        model,
-        LoraConfig(
-            r=args.rank, lora_alpha=args.alpha, lora_dropout=0.0, bias="none",
-            task_type="CAUSAL_LM",
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
-                            "gate_proj", "up_proj", "down_proj"],
-        ),
-    )
+
+    # Resume before creating a fresh adapter, or a preempted run starts over from
+    # random weights while looking like it continued.
+    resumed = args.resume and (args.output / "adapter_config.json").exists()
+    if resumed:
+        from peft import PeftModel
+        model = PeftModel.from_pretrained(model, str(args.output), is_trainable=True)
+        print(f"resumed the adapter in {args.output}")
+    else:
+        model = get_peft_model(
+            model,
+            LoraConfig(
+                r=args.rank, lora_alpha=args.alpha, lora_dropout=0.0, bias="none",
+                task_type="CAUSAL_LM",
+                target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                                "gate_proj", "up_proj", "down_proj"],
+            ),
+        )
     model.print_trainable_parameters()
 
     # Activation memory is the binding constraint in the backward pass: a full
@@ -317,6 +338,7 @@ def main() -> None:
         [p for p in model.parameters() if p.requires_grad], lr=args.lr
     )
 
+    gens = args.generations
     seen_texts: list[str] = []
     seen_groups: list[list[bool]] = []
     g = torch.Generator(device="cpu").manual_seed(args.seed)
@@ -338,16 +360,34 @@ def main() -> None:
         # change the setting underneath us.
         model.eval()
         model.config.use_cache = True
-        with torch.no_grad():
-            out = model.generate(
-                **enc,
-                max_new_tokens=args.max_new,
-                do_sample=True,
-                temperature=args.temperature,
-                top_p=0.95,
-                num_return_sequences=args.generations,
-                pad_token_id=tok.pad_token_id,
-            )
+        # OOM is a survivable condition, not the end of the run. The KV cache
+        # scales with the group size, so halving it is the one knob that reliably
+        # helps - and a smaller group still teaches something, where a crashed run
+        # at step 3 of an unattended night teaches nothing.
+        out = None
+        while out is None:
+            try:
+                with torch.no_grad():
+                    out = model.generate(
+                        **enc,
+                        max_new_tokens=args.max_new,
+                        do_sample=True,
+                        temperature=args.temperature,
+                        top_p=0.95,
+                        num_return_sequences=gens,
+                        pad_token_id=tok.pad_token_id,
+                    )
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                if gens <= args.min_generations:
+                    print(f"step {step}: OOM even at {gens} generations - skipping",
+                          file=sys.stderr, flush=True)
+                    break
+                gens = max(args.min_generations, gens // 2)
+                print(f"step {step}: OOM, retrying with {gens} generations",
+                      file=sys.stderr, flush=True)
+        if out is None:
+            continue
         completions = out[:, prompt_len:]
         texts = tok.batch_decode(completions, skip_special_tokens=True)
 
@@ -362,8 +402,18 @@ def main() -> None:
             seen_groups.append(verdicts)
             if len(seen_groups) == 10:
                 msg = reward_health(seen_texts, seen_groups, args.max_new)
+                dead = msg.startswith("***")
                 print(f"\n{msg}\n",
-                      file=sys.stderr if msg.startswith("***") else sys.stdout, flush=True)
+                      file=sys.stderr if dead else sys.stdout, flush=True)
+                if dead and args.abort_if_flat:
+                    # Ten unanimous groups means the remaining steps would train on
+                    # a zero gradient. Unattended, that silently spends the whole
+                    # session; stopping here leaves the reason on screen and the
+                    # GPU free. --no-abort-if-flat to override.
+                    print("aborting: the message above says what to change. "
+                          "Pass --no-abort-if-flat to run anyway.",
+                          file=sys.stderr, flush=True)
+                    sys.exit(2)
 
         # A flat group carries no information; skip the backward pass entirely
         # rather than spending it on a zero gradient.
@@ -377,7 +427,7 @@ def main() -> None:
         model.config.use_cache = False   # incompatible with gradient checkpointing
         opt.zero_grad(set_to_none=True)
         total = 0.0
-        for i in range(args.generations):
+        for i in range(len(advantages)):
             seq = out[i : i + 1]
             attn = (seq != tok.pad_token_id).long()
             logits = model(input_ids=seq, attention_mask=attn).logits[:, :-1]
@@ -395,7 +445,7 @@ def main() -> None:
                 continue
 
             seq_lp = tok_lp[keep].sum() / n   # length-normalised, see the loss note
-            loss = -advantages[i] * seq_lp / args.generations
+            loss = -advantages[i] * seq_lp / len(advantages)
             loss.backward()
             total += float(loss)
 
