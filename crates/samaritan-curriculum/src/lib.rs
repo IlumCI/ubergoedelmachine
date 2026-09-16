@@ -32,6 +32,33 @@ use std::collections::HashMap;
 
 /// One generated problem, in the exact shape `samaritan_corpus::load_reasoning`
 /// ingests (the example serializes it 1:1, plus a split label).
+/// One verified step of a generator's own solution.
+///
+/// The generator computed the gold from an algorithm, so it already knows every
+/// intermediate value along the way. Recording them costs nothing and buys the
+/// single most expensive ingredient in the process-supervision literature: step
+/// labels that are exact rather than inferred from sampled rollouts.
+///
+/// Two consumers, one representation. A process reward model checks `value`; a
+/// staged latent curriculum needs the step *boundaries* that `text` delimits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Step {
+    /// The step as a solver would state it, e.g. `"phi(58) = 28"`.
+    pub text: String,
+    /// The quantity this step establishes, when it has one - what a verifier
+    /// checks. `None` for a purely structural step ("Euler's theorem applies").
+    pub value: Option<String>,
+}
+
+impl Step {
+    fn new(text: impl Into<String>, value: impl Into<String>) -> Step {
+        Step { text: text.into(), value: Some(value.into()) }
+    }
+    fn note(text: impl Into<String>) -> Step {
+        Step { text: text.into(), value: None }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Problem {
     /// Stable id: `gen-<family>-d<difficulty>-s<seed>-<index>`.
@@ -43,6 +70,9 @@ pub struct Problem {
     /// Always exact-match: every family is built to have one checkable answer.
     pub answer_kind: &'static str,
     pub domain: &'static str,
+    /// The generator's own solution path. EMPTY for families not yet
+    /// instrumented - absence means "not recorded", never "no steps needed".
+    pub steps: Vec<Step>,
 }
 
 /// The template families. Each is a distinct *kind* of reasoning, so a blend
@@ -237,7 +267,23 @@ fn recurrence_at(x0: u64, p: u64, q: u64, m: u64, k: u64) -> u64 {
 
 // ----------------------------------------------------------------- families --
 
-fn make_modpow(rng: &mut SplitMix64, d: u64) -> (String, String) {
+/// Smallest e >= 1 with base^e = 1 (mod m), for base coprime to m. Direct
+/// search: m is small here by construction, and the order divides phi(m) < m.
+fn multiplicative_order(base: u64, m: u64) -> u64 {
+    if m == 1 {
+        return 1;
+    }
+    let mut cur = base % m;
+    for e in 1..=m {
+        if cur == 1 {
+            return e;
+        }
+        cur = cur * (base % m) % m;
+    }
+    1
+}
+
+fn make_modpow(rng: &mut SplitMix64, d: u64, steps: &mut Vec<Step>) -> (String, String) {
     loop {
         let a = rng.range(2, 10 + 40 * d);
         let m = rng.range(3, 10 + 30 * d);
@@ -250,11 +296,43 @@ fn make_modpow(rng: &mut SplitMix64, d: u64) -> (String, String) {
             _ => rng.range(1_000_000, 1_000_000_000),
         };
         let q = format!("What is the remainder when {a}^{b} is divided by {m}?");
-        return (q, modpow(a, b, m).to_string());
+        let gold = modpow(a, b, m);
+
+        // The trace follows the route a solver should take, not the route the
+        // code takes: reduce the base, find the multiplicative order, reduce the
+        // exponent against it, then a small power. Square-and-multiply would be
+        // a faithful record of `modpow` and a useless lesson.
+        let base = a % m;
+        steps.push(Step::new(format!("Reduce the base: {a} mod {m} = {base}"), base.to_string()));
+        let g = gcd(base, m);
+        if g == 1 {
+            let ord = multiplicative_order(base, m);
+            steps.push(Step::new(
+                format!("{base} is coprime to {m}, so its powers cycle; the multiplicative order of {base} mod {m} is {ord}"),
+                ord.to_string(),
+            ));
+            let r = b % ord;
+            steps.push(Step::new(
+                format!("Only the exponent mod the order matters: {b} mod {ord} = {r}"),
+                r.to_string(),
+            ));
+            let eff = if r == 0 { ord } else { r };
+            steps.push(Step::new(
+                format!("So {a}^{b} = {base}^{eff} (mod {m})"),
+                modpow(base, eff, m).to_string(),
+            ));
+        } else {
+            steps.push(Step::note(format!(
+                "gcd({base}, {m}) = {g} > 1, so the powers need not cycle back to 1 \
+                 and the order argument does not apply; square and multiply instead"
+            )));
+        }
+        steps.push(Step::new(format!("{a}^{b} mod {m} = {gold}"), gold.to_string()));
+        return (q, gold.to_string());
     }
 }
 
-fn make_crt(rng: &mut SplitMix64, d: u64) -> (String, String) {
+fn make_crt(rng: &mut SplitMix64, d: u64, steps: &mut Vec<Step>) -> (String, String) {
     let want = if d >= 5 { 3 } else { 2 };
     loop {
         let mut moduli: Vec<u64> = Vec::new();
@@ -290,11 +368,48 @@ fn make_crt(rng: &mut SplitMix64, d: u64) -> (String, String) {
             "Find the smallest positive integer that {}.",
             clauses.join(" and ")
         );
+
+        // Record the incremental merge, which is how CRT is actually solved:
+        // satisfy the first congruence, then step through that residue class
+        // until the next one holds, and so on. Each intermediate is a smallest
+        // simultaneous solution of a prefix - independently checkable.
+        for (i, (&m, &r)) in moduli.iter().zip(&rems).enumerate() {
+            steps.push(Step::new(
+                format!("Congruence {}: x = {r} (mod {m})", i + 1),
+                format!("{r} mod {m}"),
+            ));
+        }
+        let mut acc_mod = moduli[0];
+        let mut acc = rems[0];
+        steps.push(Step::new(
+            format!("Start from the first: x = {acc} (mod {acc_mod})"),
+            acc.to_string(),
+        ));
+        for i in 1..want {
+            let (m, r) = (moduli[i], rems[i]);
+            let mut x = acc;
+            while x % m != r {
+                x += acc_mod;
+            }
+            acc = x;
+            acc_mod *= m;
+            steps.push(Step::new(
+                format!(
+                    "Step through that class until x = {r} (mod {m}): x = {acc}, \
+                     now fixed mod {acc_mod}"
+                ),
+                acc.to_string(),
+            ));
+        }
+        steps.push(Step::new(
+            format!("Smallest positive solution: {gold}"),
+            gold.to_string(),
+        ));
         return (q, gold.to_string());
     }
 }
 
-fn make_recurrence(rng: &mut SplitMix64, d: u64) -> (String, String) {
+fn make_recurrence(rng: &mut SplitMix64, d: u64, steps: &mut Vec<Step>) -> (String, String) {
     let m = rng.range(5, 20 + 40 * d);
     let p = rng.range(2, 9);
     let q = rng.range(0, m - 1);
@@ -308,13 +423,59 @@ fn make_recurrence(rng: &mut SplitMix64, d: u64) -> (String, String) {
         "A sequence is defined by a(1) = {x0}, and a(n+1) = ({p}*a(n) + {q}) mod {m} for n >= 1. \
          What is a({k})?"
     );
-    (question, recurrence_at(x0, p, q, m, k).to_string())
+    let gold = recurrence_at(x0, p, q, m, k);
+
+    // The lesson is that a linear map on Z_m must cycle within m states, so a(k)
+    // for astronomical k is an index into that cycle. Record the cycle's shape,
+    // not two billion iterations.
+    let (mu, lambda) = recurrence_cycle(x0, p, q, m);
+    steps.push(Step::new(
+        format!("The map x -> ({p}x + {q}) mod {m} has only {m} possible states, so it must cycle"),
+        m.to_string(),
+    ));
+    steps.push(Step::new(
+        format!("It enters the cycle after {mu} term(s), and the cycle length is {lambda}"),
+        format!("mu={mu}, lambda={lambda}"),
+    ));
+    let idx = k - 1;
+    if idx >= mu {
+        let off = mu + (idx - mu) % lambda;
+        steps.push(Step::new(
+            format!(
+                "a({k}) is term {idx} (0-based); {idx} >= {mu}, so it equals term \
+                 {mu} + ({idx} - {mu}) mod {lambda} = {off}"
+            ),
+            off.to_string(),
+        ));
+    } else {
+        steps.push(Step::note(format!(
+            "a({k}) is term {idx}, still before the cycle begins - iterate directly"
+        )));
+    }
+    steps.push(Step::new(format!("a({k}) = {gold}"), gold.to_string()));
+    (question, gold.to_string())
+}
+
+/// Where the orbit of x0 under x -> (p·x + q) mod m enters its cycle, and how
+/// long that cycle is. Returns (mu, lambda) with term indices 0-based.
+fn recurrence_cycle(x0: u64, p: u64, q: u64, m: u64) -> (u64, u64) {
+    let mut seen: HashMap<u64, u64> = HashMap::new();
+    let mut x = x0 % m;
+    let mut i = 0u64;
+    loop {
+        if let Some(&first) = seen.get(&x) {
+            return (first, i - first);
+        }
+        seen.insert(x, i);
+        x = (p * x + q) % m;
+        i += 1;
+    }
 }
 
 const NAMES: &[&str] = &["Maya", "Tomas", "Imani", "Viktor", "Sana", "Diego", "Lena"];
 const ITEMS: &[&str] = &["marble", "sticker", "coin", "seashell", "postcard", "bead"];
 
-fn make_word(rng: &mut SplitMix64, d: u64) -> (String, String) {
+fn make_word(rng: &mut SplitMix64, d: u64, _steps: &mut Vec<Step>) -> (String, String) {
     let name = *rng.pick(NAMES);
     let item = *rng.pick(ITEMS);
     let mut v: i64 = rng.range(8, 20 + 10 * d) as i64;
@@ -415,7 +576,7 @@ fn solutions(stmts: &[Stmt], n: usize) -> Vec<Vec<bool>> {
     out
 }
 
-fn make_knights(rng: &mut SplitMix64, d: u64) -> (String, String) {
+fn make_knights(rng: &mut SplitMix64, d: u64, _steps: &mut Vec<Step>) -> (String, String) {
     let n = ((2 + d) as usize).min(7);
     // Bounded, because an unsatisfiable configuration must fail loudly rather
     // than spin: this loop hung forever at d1 until the count statement below was
@@ -532,7 +693,7 @@ fn dfa_count_accepted(delta: &[[usize; 2]], accepting: &[bool], len: u64) -> u64
     counts.iter().enumerate().filter(|(st, _)| accepting[*st]).map(|(_, c)| *c).sum()
 }
 
-fn make_automata(rng: &mut SplitMix64, d: u64) -> (String, String) {
+fn make_automata(rng: &mut SplitMix64, d: u64, _steps: &mut Vec<Step>) -> (String, String) {
     let n = (2 + d).min(6) as usize;
     let len = match d {
         1 => rng.range(3, 5),
@@ -629,7 +790,7 @@ fn mst_weight(n: usize, edges: &[(usize, usize, u64)]) -> Option<u64> {
     (used == n - 1).then_some(total)
 }
 
-fn make_graph(rng: &mut SplitMix64, d: u64) -> (String, String) {
+fn make_graph(rng: &mut SplitMix64, d: u64, _steps: &mut Vec<Step>) -> (String, String) {
     let n = (4 + d).min(8) as usize;
     let max_w = 5 + 5 * d;
     for _attempt in 0..500 {
@@ -684,7 +845,7 @@ fn divide_conquer_value(a: u64, b: u64, c: u64, e: u32, base: u64, k: u32) -> u6
     t
 }
 
-fn make_divide_conquer(rng: &mut SplitMix64, d: u64) -> (String, String) {
+fn make_divide_conquer(rng: &mut SplitMix64, d: u64, _steps: &mut Vec<Step>) -> (String, String) {
     let b = *rng.pick(&[2u64, 2, 3]);
     let a = match d {
         1 | 2 => rng.range(1, 3),
@@ -726,7 +887,7 @@ fn sat_count(vars: usize, clauses: &[Vec<(usize, bool)>]) -> u64 {
     count
 }
 
-fn make_sat(rng: &mut SplitMix64, d: u64) -> (String, String) {
+fn make_sat(rng: &mut SplitMix64, d: u64, _steps: &mut Vec<Step>) -> (String, String) {
     let vars = (3 + d).min(7) as usize;
     let n_clauses = (3 + 2 * d).min(12) as usize;
     let total = 1u64 << vars;
@@ -890,7 +1051,7 @@ fn zebra_solutions(k: usize, cons: &[ZCon], perms: &[Vec<usize>]) -> usize {
     }
 }
 
-fn make_zebra(rng: &mut SplitMix64, d: u64) -> (String, String) {
+fn make_zebra(rng: &mut SplitMix64, d: u64, _steps: &mut Vec<Step>) -> (String, String) {
     let (n, k) = match d {
         1 => (3usize, 2usize),
         2 => (4, 2),
@@ -1025,18 +1186,33 @@ fn make_zebra(rng: &mut SplitMix64, d: u64) -> (String, String) {
 
 /// Generate one problem of `family` at `difficulty` (clamped to 1..=5).
 pub fn generate(family: Family, difficulty: u64, rng: &mut SplitMix64) -> (String, String) {
+    generate_traced(family, difficulty, rng, &mut Vec::new())
+}
+
+/// As `generate`, but also collects the generator's solution steps.
+///
+/// Note the sink is CLEARED on entry: several families retry on a degenerate
+/// draw, and steps pushed by an abandoned attempt would otherwise be reported
+/// as part of the solution that was finally kept.
+pub fn generate_traced(
+    family: Family,
+    difficulty: u64,
+    rng: &mut SplitMix64,
+    steps: &mut Vec<Step>,
+) -> (String, String) {
+    steps.clear();
     let d = difficulty.clamp(1, 5);
     match family {
-        Family::ModPow => make_modpow(rng, d),
-        Family::Crt => make_crt(rng, d),
-        Family::Recurrence => make_recurrence(rng, d),
-        Family::Word => make_word(rng, d),
-        Family::Knights => make_knights(rng, d),
-        Family::Automata => make_automata(rng, d),
-        Family::Graph => make_graph(rng, d),
-        Family::DivideConquer => make_divide_conquer(rng, d),
-        Family::Sat => make_sat(rng, d),
-        Family::Zebra => make_zebra(rng, d),
+        Family::ModPow => make_modpow(rng, d, steps),
+        Family::Crt => make_crt(rng, d, steps),
+        Family::Recurrence => make_recurrence(rng, d, steps),
+        Family::Word => make_word(rng, d, steps),
+        Family::Knights => make_knights(rng, d, steps),
+        Family::Automata => make_automata(rng, d, steps),
+        Family::Graph => make_graph(rng, d, steps),
+        Family::DivideConquer => make_divide_conquer(rng, d, steps),
+        Family::Sat => make_sat(rng, d, steps),
+        Family::Zebra => make_zebra(rng, d, steps),
     }
 }
 
@@ -1054,13 +1230,15 @@ pub fn generate_set(
     let mut out = Vec::with_capacity(count);
     for i in 0..count {
         let family = families[i % families.len()];
-        let (question, answer) = generate(family, d, &mut rng);
+        let mut steps = Vec::new();
+        let (question, answer) = generate_traced(family, d, &mut rng, &mut steps);
         out.push(Problem {
             id: format!("gen-{}-d{}-s{}-{}", family.name(), d, seed, i + 1),
             question,
             answer,
             answer_kind: "exactMatch",
             domain: family.domain(),
+            steps,
         });
     }
     out
@@ -1100,7 +1278,7 @@ mod tests {
     fn crt_gold_satisfies_every_congruence_and_is_minimal() {
         let mut rng = SplitMix64::new(7);
         for _ in 0..25 {
-            let (q, gold) = make_crt(&mut rng, 3);
+            let (q, gold) = make_crt(&mut rng, 3, &mut Vec::new());
             let x: u64 = gold.parse().unwrap();
             // Re-derive the constraints from the question text itself, so the
             // test checks what the *model* will read, not internal state.
@@ -1140,7 +1318,7 @@ mod tests {
     fn knights_puzzles_have_exactly_one_solution_and_a_consistent_gold() {
         let mut rng = SplitMix64::new(99);
         for _ in 0..20 {
-            let (q, a) = make_knights(&mut rng, 3);
+            let (q, a) = make_knights(&mut rng, 3, &mut Vec::new());
             assert!(q.contains("knights always tell the truth"));
             // Gold is either a small integer or the word knight/knave.
             let ok = a.parse::<u64>().is_ok() || a == "knight" || a == "knave";
@@ -1153,7 +1331,7 @@ mod tests {
         let mut rng = SplitMix64::new(5);
         for d in 1..=5 {
             for _ in 0..10 {
-                let (q, a) = make_word(&mut rng, d);
+                let (q, a) = make_word(&mut rng, d, &mut Vec::new());
                 let v: i64 = a.parse().unwrap();
                 assert!(v >= 0, "{q} -> {a}");
                 assert!(q.ends_with("have now?"));
@@ -1452,7 +1630,7 @@ mod zebra_tests {
             let mut rng = SplitMix64::new(300 + d);
             let reps = if d >= 5 { 1 } else { 3 };
             for _ in 0..reps {
-                let (q, a) = make_zebra(&mut rng, d);
+                let (q, a) = make_zebra(&mut rng, d, &mut Vec::new());
                 assert!(q.contains("Clues:"), "d{d}: malformed puzzle");
                 assert!(!a.is_empty(), "d{d}: empty gold");
                 // Gold is either a house number or one of the attribute words.
@@ -1481,5 +1659,222 @@ mod zebra_tests {
             // Fully pinned: exactly one solution before any minimisation.
             assert_eq!(zebra_solutions(k, &cons, &perms), 1);
         }
+    }
+}
+
+#[cfg(test)]
+mod step_tests {
+    use super::*;
+
+    /// Families whose generators record their solution path. Adding a family
+    /// here without instrumenting it fails loudly, rather than silently
+    /// shipping empty supervision.
+    const INSTRUMENTED: &[Family] = &[Family::ModPow, Family::Crt, Family::Recurrence];
+
+    /// The contract everything else rests on: the last recorded step states the
+    /// answer. A trace that wanders off and lands elsewhere is worse than no
+    /// trace — it would train toward a conclusion the grader then marks wrong.
+    #[test]
+    fn last_step_agrees_with_the_gold() {
+        for &family in INSTRUMENTED {
+            for d in 1..=5u64 {
+                for p in &generate_set(6, &[family], d, 4000 + d) {
+                    assert!(
+                        !p.steps.is_empty(),
+                        "{} d{d}: instrumented family produced no steps",
+                        family.name()
+                    );
+                    let last = p.steps.last().unwrap();
+                    assert_eq!(
+                        last.value.as_deref(),
+                        Some(p.answer.as_str()),
+                        "{} d{d}: last step {:?} does not state the gold {}",
+                        family.name(),
+                        last.text,
+                        p.answer
+                    );
+                }
+            }
+        }
+    }
+
+    /// Every step must say something. A blank step is a boundary with no
+    /// content, which is precisely the homogeneous-latent failure that step
+    /// supervision exists to prevent.
+    #[test]
+    fn steps_are_substantive() {
+        for &family in INSTRUMENTED {
+            for d in [1u64, 3, 5] {
+                for p in &generate_set(6, &[family], d, 4100 + d) {
+                    for (i, s) in p.steps.iter().enumerate() {
+                        assert!(
+                            s.text.trim().len() > 5,
+                            "{} d{d} step {i}: text too thin: {:?}",
+                            family.name(),
+                            s.text
+                        );
+                        if let Some(v) = &s.value {
+                            assert!(
+                                !v.trim().is_empty(),
+                                "{} d{d} step {i}: empty value",
+                                family.name()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Independent re-derivation, not self-consistency. The modpow trace claims
+    /// a multiplicative order; check it really is the smallest exponent
+    /// returning 1, by exhaustive search that shares no path with the
+    /// generator's own shortcut.
+    #[test]
+    fn modpow_order_claim_is_true() {
+        let mut checked = 0;
+        for d in 1..=5u64 {
+            for p in &generate_set(8, &[Family::ModPow], d, 4200 + d) {
+                let Some(step) = p.steps.iter().find(|s| s.text.contains("multiplicative order"))
+                else {
+                    continue; // non-coprime draw: no order claimed, nothing to check
+                };
+                let nums = digits(&p.steps[0].text);
+                let (m, base) = (nums[1], nums[2]);
+                let claimed: u64 = step.value.as_ref().unwrap().parse().unwrap();
+
+                let mut smallest = None;
+                for e in 1..=m {
+                    if modpow(base, e, m) == 1 {
+                        smallest = Some(e);
+                        break;
+                    }
+                }
+                assert_eq!(
+                    Some(claimed),
+                    smallest,
+                    "{}: claimed order {claimed} for {base} mod {m}, search says {smallest:?}",
+                    p.id
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked >= 10, "only {checked} order claims exercised");
+    }
+
+    /// Each CRT merge states the smallest solution of a PREFIX of the
+    /// congruences. Verified by brute force over the trace's own numbers, so
+    /// the check cannot inherit a bug from the incremental merge it verifies.
+    #[test]
+    fn crt_intermediates_solve_their_prefix() {
+        let mut checked = 0;
+        for d in 1..=5u64 {
+            for p in &generate_set(6, &[Family::Crt], d, 4300 + d) {
+                let pairs: Vec<(u64, u64)> = p
+                    .steps
+                    .iter()
+                    .filter(|s| s.text.starts_with("Congruence "))
+                    .map(|s| {
+                        let n = digits(&s.text);
+                        (n[2], n[1]) // (modulus, remainder); n[0] is the index
+                    })
+                    .collect();
+                assert!(pairs.len() >= 2, "{}: expected at least 2 congruences", p.id);
+
+                let merges: Vec<u64> = p
+                    .steps
+                    .iter()
+                    .filter(|s| {
+                        s.text.starts_with("Start from") || s.text.starts_with("Step through")
+                    })
+                    .map(|s| s.value.as_ref().unwrap().parse().unwrap())
+                    .collect();
+                assert_eq!(merges.len(), pairs.len(), "{}: one merge per congruence", p.id);
+
+                for (k, &got) in merges.iter().enumerate() {
+                    let prefix = &pairs[..=k];
+                    let bound: u64 = prefix.iter().map(|(m, _)| m).product();
+                    let brute =
+                        (1..=bound).find(|x| prefix.iter().all(|&(m, r)| x % m == r));
+                    assert_eq!(
+                        Some(got),
+                        brute,
+                        "{}: merge {k} says {got}, brute force says {brute:?}",
+                        p.id
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked >= 20, "only {checked} prefix solutions exercised");
+    }
+
+    /// Recording steps must not perturb the problems themselves: same seed,
+    /// same questions and golds, sink or no sink.
+    #[test]
+    fn tracing_does_not_change_what_is_generated() {
+        for &family in &Family::all() {
+            for d in [1u64, 3, 5] {
+                let with = generate_set(4, &[family], d, 4400 + d);
+                let mut rng = SplitMix64::new(4400 + d);
+                for p in &with {
+                    let (q, a) = generate(family, d, &mut rng);
+                    assert_eq!(q, p.question, "{} d{d}: question drifted", family.name());
+                    assert_eq!(a, p.answer, "{} d{d}: gold drifted", family.name());
+                }
+            }
+        }
+    }
+
+    /// An abandoned retry must not leak its steps into the problem finally kept.
+    #[test]
+    fn sink_is_cleared_between_problems() {
+        let mut steps = vec![Step::note("stale from a previous call")];
+        let mut rng = SplitMix64::new(4500);
+        generate_traced(Family::ModPow, 3, &mut rng, &mut steps);
+        assert!(
+            !steps.iter().any(|s| s.text.contains("stale")),
+            "generate_traced did not clear the sink"
+        );
+    }
+
+    /// Step text becomes training data, so it has to read as prose a person
+    /// would write. A run of spaces from a joined source line is invisible in
+    /// code review and conspicuous in a corpus.
+    #[test]
+    fn step_text_is_clean_prose() {
+        for &family in INSTRUMENTED {
+            for d in 1..=5u64 {
+                for p in &generate_set(6, &[family], d, 4600 + d) {
+                    for s in &p.steps {
+                        assert!(
+                            !s.text.contains("  "),
+                            "{}: run of spaces in step text: {:?}",
+                            p.id,
+                            s.text
+                        );
+                        assert!(
+                            !s.text.contains('\n') && !s.text.contains('\t'),
+                            "{}: control whitespace in step text: {:?}",
+                            p.id,
+                            s.text
+                        );
+                        assert_eq!(
+                            s.text.trim(),
+                            s.text,
+                            "{}: step text has edge whitespace",
+                            p.id
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn digits(text: &str) -> Vec<u64> {
+        text.split(|c: char| !c.is_ascii_digit())
+            .filter(|t| !t.is_empty())
+            .filter_map(|t| t.parse().ok())
+            .collect()
     }
 }

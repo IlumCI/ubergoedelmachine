@@ -105,6 +105,19 @@ fn main() {
                 "answer_kind": p.answer_kind,
                 "domain": p.domain,
                 "split": split,
+                // The generator's own solution path, when it records one. Null
+                // rather than an empty list, so a consumer can tell "this family
+                // is not instrumented yet" from "this problem needed no steps".
+                "steps": if p.steps.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::Value::Array(
+                        p.steps
+                            .iter()
+                            .map(|s| serde_json::json!({ "text": s.text, "value": s.value }))
+                            .collect(),
+                    )
+                },
             })
             .to_string(),
         );
@@ -119,6 +132,12 @@ fn main() {
     for f in &families {
         print!(" {}", f.name());
     }
+    let traced = problems.iter().filter(|p| !p.steps.is_empty()).count();
+    println!(
+        "solution traces: {traced}/{} problems, {} step(s) total",
+        problems.len(),
+        problems.iter().map(|p| p.steps.len()).sum::<usize>()
+    );
     println!("\nby domain:");
     for (d, n) in &by_domain {
         println!("  {d:<8} {n}");
