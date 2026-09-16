@@ -107,9 +107,10 @@ def parse_args() -> argparse.Namespace:
         "--init-adapter",
         type=Path,
         default=None,
-        help="start from an existing LoRA (e.g. the SFT student) instead of the "
-             "raw base - the SFT-then-RL order, and the concise student wastes "
-             "less of the rollout budget",
+        help="continue an existing LoRA instead of training the raw base. NOT for "
+             "the 185-trace student: measured 2026-09-16 it scores 30/40 against "
+             "the base's 39/40 (p=0.012) and runs past 16k tokens on 9 of 40 "
+             "items, so initialising from it inherits a model that will not stop",
     )
     p.add_argument("--steps", type=int, default=200)
     p.add_argument("--lr", type=float, default=5e-6,
