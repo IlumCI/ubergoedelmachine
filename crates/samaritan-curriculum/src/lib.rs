@@ -125,6 +125,23 @@ pub enum Family {
 }
 
 impl Family {
+    /// Every family records its own solution path. Kept as a constant so the
+    /// step tests cover all of them by construction - a new family that forgets
+    /// to push steps fails the suite instead of quietly shipping empty
+    /// supervision.
+    pub const ALL_INSTRUMENTED: [Family; 10] = [
+        Family::ModPow,
+        Family::Crt,
+        Family::Recurrence,
+        Family::Word,
+        Family::Knights,
+        Family::Automata,
+        Family::Graph,
+        Family::DivideConquer,
+        Family::Sat,
+        Family::Zebra,
+    ];
+
     pub fn all() -> Vec<Family> {
         vec![
             Family::ModPow,
@@ -475,18 +492,20 @@ fn recurrence_cycle(x0: u64, p: u64, q: u64, m: u64) -> (u64, u64) {
 const NAMES: &[&str] = &["Maya", "Tomas", "Imani", "Viktor", "Sana", "Diego", "Lena"];
 const ITEMS: &[&str] = &["marble", "sticker", "coin", "seashell", "postcard", "bead"];
 
-fn make_word(rng: &mut SplitMix64, d: u64, _steps: &mut Vec<Step>) -> (String, String) {
+fn make_word(rng: &mut SplitMix64, d: u64, steps: &mut Vec<Step>) -> (String, String) {
     let name = *rng.pick(NAMES);
     let item = *rng.pick(ITEMS);
     let mut v: i64 = rng.range(8, 20 + 10 * d) as i64;
     let mut sentences = vec![format!("{name} has {v} {item}s.")];
-    let steps = 1 + d;
-    for _ in 0..steps {
+    steps.push(Step::new(format!("Start: {name} has {v} {item}s"), v.to_string()));
+    let n_ops = 1 + d;
+    for _ in 0..n_ops {
         match rng.range(0, 3) {
             0 => {
                 let b = rng.range(2, 5 + 9 * d) as i64;
                 v += b;
                 sentences.push(format!("{name} then buys {b} more {item}s."));
+                steps.push(Step::new(format!("Buys {b} more: {} + {b} = {v}", v - b), v.to_string()));
             }
             1 => {
                 if v < 3 {
@@ -496,6 +515,7 @@ fn make_word(rng: &mut SplitMix64, d: u64, _steps: &mut Vec<Step>) -> (String, S
                 v -= c;
                 let friend = *rng.pick(NAMES);
                 sentences.push(format!("{name} gives {c} {item}s to {friend}."));
+                steps.push(Step::new(format!("Gives away {c}: {} - {c} = {v}", v + c), v.to_string()));
             }
             2 => {
                 if v > 2_000 {
@@ -505,6 +525,7 @@ fn make_word(rng: &mut SplitMix64, d: u64, _steps: &mut Vec<Step>) -> (String, S
                 v *= k;
                 let word = if k == 2 { "doubles" } else { "triples" };
                 sentences.push(format!("{name} {word} the collection."));
+                steps.push(Step::new(format!("{word}: {} x {k} = {v}", v / k), v.to_string()));
             }
             _ => {
                 // Split into equal shares and keep one — only when it divides.
@@ -517,6 +538,7 @@ fn make_word(rng: &mut SplitMix64, d: u64, _steps: &mut Vec<Step>) -> (String, S
                 sentences.push(format!(
                     "{name} splits the {item}s equally into {k} bags and keeps just one bag."
                 ));
+                steps.push(Step::new(format!("Keeps one of {k} equal bags: {} / {k} = {v}", v * k), v.to_string()));
             }
         }
     }
@@ -533,7 +555,14 @@ fn make_word(rng: &mut SplitMix64, d: u64, _steps: &mut Vec<Step>) -> (String, S
         let pos = rng.range(1, sentences.len() as u64 - 1) as usize;
         sentences.insert(pos, distractor);
     }
+    if d > 1 {
+        steps.push(Step::note(
+            "Sentences about other people, prices or weights change nothing here - \
+             they are not operations on this collection",
+        ));
+    }
     sentences.push(format!("How many {item}s does {name} have now?"));
+    steps.push(Step::new(format!("{name} now has {v} {item}s"), v.to_string()));
     (sentences.join(" "), v.to_string())
 }
 
@@ -576,7 +605,7 @@ fn solutions(stmts: &[Stmt], n: usize) -> Vec<Vec<bool>> {
     out
 }
 
-fn make_knights(rng: &mut SplitMix64, d: u64, _steps: &mut Vec<Step>) -> (String, String) {
+fn make_knights(rng: &mut SplitMix64, d: u64, steps: &mut Vec<Step>) -> (String, String) {
     let n = ((2 + d) as usize).min(7);
     // Bounded, because an unsatisfiable configuration must fail loudly rather
     // than spin: this loop hung forever at d1 until the count statement below was
@@ -648,13 +677,41 @@ fn make_knights(rng: &mut SplitMix64, d: u64, _steps: &mut Vec<Step>) -> (String
         }
         // Ask for the count (integer) or one person's kind (word) — both are
         // pinned by the unique solution and both grade as exact matches.
+        // Same narrowing shape as sat: how many of the 2^n knight/knave
+        // assignments survive each statement, in order.
+        steps.push(Step::new(
+            format!("{n} islanders, so {} knight/knave assignments to consider", 1usize << n),
+            (1usize << n).to_string(),
+        ));
+        for i in 0..stmts.len() {
+            let left = solutions(&stmts[..=i], n).len();
+            steps.push(Step::new(
+                format!("After statement {}: {left} assignment(s) remain consistent", i + 1),
+                left.to_string(),
+            ));
+        }
+        let who_is: Vec<String> = (0..n)
+            .map(|i| format!("{} is a {}", names[i], if sol[i] { "knight" } else { "knave" }))
+            .collect();
+        steps.push(Step::new(
+            format!("The one consistent assignment: {}", who_is.join(", ")),
+            format!("{true_count} knights"),
+        ));
         if rng.chance(50) {
             text.push_str(" How many of the islanders are knights?");
+            steps.push(Step::new(
+                format!("Knights: {true_count}"),
+                true_count.to_string(),
+            ));
             return (text, true_count.to_string());
         }
         let who = rng.range(0, n as u64 - 1) as usize;
         text.push_str(&format!(" Is {} a knight or a knave?", names[who]));
         let kind = if sol[who] { "knight" } else { "knave" };
+        steps.push(Step::new(
+            format!("{} is a {kind}", names[who]),
+            kind.to_string(),
+        ));
         return (text, kind.to_string());
     }
     panic!(
@@ -693,7 +750,18 @@ fn dfa_count_accepted(delta: &[[usize; 2]], accepting: &[bool], len: u64) -> u64
     counts.iter().enumerate().filter(|(st, _)| accepting[*st]).map(|(_, c)| *c).sum()
 }
 
-fn make_automata(rng: &mut SplitMix64, d: u64, _steps: &mut Vec<Step>) -> (String, String) {
+/// `q0=1, q1=0, ...` - the state distribution, as a step value a verifier can
+/// compare exactly.
+fn fmt_counts(counts: &[u64]) -> String {
+    counts
+        .iter()
+        .enumerate()
+        .map(|(i, c)| format!("q{i}={c}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn make_automata(rng: &mut SplitMix64, d: u64, steps: &mut Vec<Step>) -> (String, String) {
     let n = (2 + d).min(6) as usize;
     let len = match d {
         1 => rng.range(3, 5),
@@ -731,6 +799,40 @@ fn make_automata(rng: &mut SplitMix64, d: u64, _steps: &mut Vec<Step>) -> (Strin
             " The accepting states are {}. How many distinct strings of length {len} over the \
              alphabet {{a, b}} does this automaton accept?",
             acc.join(", ")
+        ));
+        // The lesson is the recurrence: track HOW MANY strings reach each state
+        // after j symbols, not which strings. That turns 2^len paths into len
+        // updates over n numbers, and it is the step a solver has to discover.
+        steps.push(Step::note(
+            "Count strings by state rather than enumerating them: let c_j[s] be \
+             the number of length-j strings that end in state s",
+        ));
+        let mut counts = vec![0u64; n];
+        counts[0] = 1;
+        steps.push(Step::new(
+            "After 0 symbols: only the empty string, in q0".to_string(),
+            fmt_counts(&counts),
+        ));
+        for j in 1..=len {
+            let mut next = vec![0u64; n];
+            for (st, &cnt) in counts.iter().enumerate() {
+                if cnt == 0 {
+                    continue;
+                }
+                for sym in 0..2 {
+                    next[delta[st][sym]] += cnt;
+                }
+            }
+            counts = next;
+            steps.push(Step::new(
+                format!("After {j} symbol(s): {}", fmt_counts(&counts)),
+                fmt_counts(&counts),
+            ));
+        }
+        let acc_sum: u64 = (0..n).filter(|i| accepting[*i]).map(|i| counts[i]).sum();
+        steps.push(Step::new(
+            format!("Sum over the accepting states {}: {acc_sum}", acc.join(", ")),
+            acc_sum.to_string(),
         ));
         return (q, gold.to_string());
     }
@@ -790,7 +892,16 @@ fn mst_weight(n: usize, edges: &[(usize, usize, u64)]) -> Option<u64> {
     (used == n - 1).then_some(total)
 }
 
-fn make_graph(rng: &mut SplitMix64, d: u64, _steps: &mut Vec<Step>) -> (String, String) {
+/// Union-find root with path compression, for the Kruskal trace.
+fn find_root(parent: &mut Vec<usize>, mut x: usize) -> usize {
+    while parent[x] != x {
+        parent[x] = parent[parent[x]];
+        x = parent[x];
+    }
+    x
+}
+
+fn make_graph(rng: &mut SplitMix64, d: u64, steps: &mut Vec<Step>) -> (String, String) {
     let n = (4 + d).min(8) as usize;
     let max_w = 5 + 5 * d;
     for _attempt in 0..500 {
@@ -823,10 +934,74 @@ fn make_graph(rng: &mut SplitMix64, d: u64, _steps: &mut Vec<Step>) -> (String, 
         q.push('.');
         if ask_mst {
             q.push_str(" What is the total weight of a minimum spanning tree of this graph?");
+            // Kruskal: cheapest edge first, skip any that closes a cycle. The
+            // running total after each accepted edge is checkable on its own.
+            steps.push(Step::note(
+                "Minimum spanning tree by Kruskal: consider edges cheapest first, \
+                 keeping one only if it joins two so-far-separate components",
+            ));
+            let mut sorted = edges.clone();
+            sorted.sort_by_key(|&(_, _, w)| w);
+            let mut parent: Vec<usize> = (0..n).collect();
+            let mut total = 0u64;
+            let mut taken = 0usize;
+            for (u, v, w) in sorted {
+                let (ru, rv) = (find_root(&mut parent, u), find_root(&mut parent, v));
+                if ru == rv {
+                    continue; // would close a cycle
+                }
+                parent[ru] = rv;
+                total += w;
+                taken += 1;
+                steps.push(Step::new(
+                    format!("Take v{u}-v{v} (weight {w}); running total {total}, {taken} of {} edges", n - 1),
+                    total.to_string(),
+                ));
+                if taken == n - 1 {
+                    break;
+                }
+            }
+            steps.push(Step::new(format!("Total MST weight: {total}"), total.to_string()));
         } else {
             q.push_str(&format!(
                 " What is the weight of the shortest path from v0 to v{}?",
                 n - 1
+            ));
+            // Dijkstra: settle the nearest unsettled vertex, in order. Each
+            // settled distance is final, so each is a verifiable step.
+            steps.push(Step::note(
+                "Shortest path by Dijkstra: repeatedly settle the nearest \
+                 unsettled vertex, whose distance can no longer improve",
+            ));
+            let mut dist = vec![u64::MAX; n];
+            let mut done = vec![false; n];
+            dist[0] = 0;
+            loop {
+                let Some(u) = (0..n)
+                    .filter(|&i| !done[i] && dist[i] != u64::MAX)
+                    .min_by_key(|&i| dist[i])
+                else {
+                    break;
+                };
+                done[u] = true;
+                steps.push(Step::new(
+                    format!("Settle v{u} at distance {}", dist[u]),
+                    dist[u].to_string(),
+                ));
+                if u == n - 1 {
+                    break;
+                }
+                for &(a, b, w) in &edges {
+                    for (x, y) in [(a, b), (b, a)] {
+                        if x == u && !done[y] && dist[u] + w < dist[y] {
+                            dist[y] = dist[u] + w;
+                        }
+                    }
+                }
+            }
+            steps.push(Step::new(
+                format!("Shortest path v0 to v{}: {gold}", n - 1),
+                gold.to_string(),
             ));
         }
         return (q, gold.to_string());
@@ -845,7 +1020,7 @@ fn divide_conquer_value(a: u64, b: u64, c: u64, e: u32, base: u64, k: u32) -> u6
     t
 }
 
-fn make_divide_conquer(rng: &mut SplitMix64, d: u64, _steps: &mut Vec<Step>) -> (String, String) {
+fn make_divide_conquer(rng: &mut SplitMix64, d: u64, steps: &mut Vec<Step>) -> (String, String) {
     let b = *rng.pick(&[2u64, 2, 3]);
     let a = match d {
         1 | 2 => rng.range(1, 3),
@@ -871,6 +1046,22 @@ fn make_divide_conquer(rng: &mut SplitMix64, d: u64, _steps: &mut Vec<Step>) -> 
          T(1) = {base}. The recursion applies whenever n > 1 and n is a power of {b}. What is \
          the exact value of T({n})?"
     );
+
+    // Unroll from the base case upward, one power of b at a time. The Master
+    // Theorem gives only an asymptotic class, and the question asks for an exact
+    // value - so the trace shows the evaluation the answer actually requires.
+    steps.push(Step::new(format!("Base case: T(1) = {base}"), base.to_string()));
+    let mut t = base;
+    for i in 1..=k {
+        let ni = b.pow(i);
+        let prev = t;
+        t = a * t + c * ni.pow(e);
+        steps.push(Step::new(
+            format!("T({ni}) = {a}*T({}) + {c}*{ni}^{e} = {a}*{prev} + {} = {t}",
+                    b.pow(i - 1), c * ni.pow(e)),
+            t.to_string(),
+        ));
+    }
     (q, gold.to_string())
 }
 
@@ -887,7 +1078,7 @@ fn sat_count(vars: usize, clauses: &[Vec<(usize, bool)>]) -> u64 {
     count
 }
 
-fn make_sat(rng: &mut SplitMix64, d: u64, _steps: &mut Vec<Step>) -> (String, String) {
+fn make_sat(rng: &mut SplitMix64, d: u64, steps: &mut Vec<Step>) -> (String, String) {
     let vars = (3 + d).min(7) as usize;
     let n_clauses = (3 + 2 * d).min(12) as usize;
     let total = 1u64 << vars;
@@ -940,6 +1131,25 @@ fn make_sat(rng: &mut SplitMix64, d: u64, _steps: &mut Vec<Step>) -> (String, St
              possible truth assignments satisfy it?",
             names.join(", ")
         );
+        // Narrowing, clause by clause. Enumerating all 2^n assignments is the
+        // brute-force answer; the count surviving each PREFIX is the reasoning,
+        // and each one can be rechecked against the clauses alone.
+        steps.push(Step::new(
+            format!("{vars} variables, so {total} assignments before any clause is applied"),
+            total.to_string(),
+        ));
+        for i in 0..clauses.len() {
+            let surviving = sat_count(vars, &clauses[..=i]);
+            steps.push(Step::new(
+                format!("After clause {}: {surviving} assignment(s) still satisfy clauses 1..{}",
+                        i + 1, i + 1),
+                surviving.to_string(),
+            ));
+        }
+        steps.push(Step::new(
+            format!("Satisfying assignments: {gold}"),
+            gold.to_string(),
+        ));
         return (q, gold.to_string());
     }
     panic!("sat: no non-degenerate formula in 500 draws at difficulty {d} (vars={vars})");
@@ -1051,7 +1261,62 @@ fn zebra_solutions(k: usize, cons: &[ZCon], perms: &[Vec<usize>]) -> usize {
     }
 }
 
-fn make_zebra(rng: &mut SplitMix64, d: u64, _steps: &mut Vec<Step>) -> (String, String) {
+/// How many grids satisfy `cons`, counting no further than `cap`.
+///
+/// Distinct from `zebra_solutions`, which returns as soon as it sees a second
+/// solution because all it is asked is whether the answer is unique. A trace
+/// needs the actual count, and a cap keeps that affordable on the early
+/// prefixes where the survivors number in the thousands.
+///
+/// Returns `(count, exact)`; `exact` is false when the cap was reached.
+fn zebra_count_upto(
+    k: usize,
+    cons: &[ZCon],
+    perms: &[Vec<usize>],
+    cap: usize,
+) -> (usize, bool) {
+    let cand: Vec<Vec<&Vec<usize>>> = (0..k)
+        .map(|c| {
+            perms
+                .iter()
+                .filter(|perm| {
+                    cons.iter().all(|con| match *con {
+                        ZCon::At { cat, val, pos } if cat == c => perm[val] == pos,
+                        _ => true,
+                    })
+                })
+                .collect()
+        })
+        .collect();
+    if cand.iter().any(|c| c.is_empty()) {
+        return (0, true);
+    }
+    let mut idx = vec![0usize; k];
+    let mut found = 0usize;
+    loop {
+        let place: Vec<Vec<usize>> = (0..k).map(|c| cand[c][idx[c]].to_vec()).collect();
+        if cons.iter().all(|c| zcon_holds(c, &place)) {
+            found += 1;
+            if found >= cap {
+                return (found, false);
+            }
+        }
+        let mut carry = 0;
+        while carry < k {
+            idx[carry] += 1;
+            if idx[carry] < cand[carry].len() {
+                break;
+            }
+            idx[carry] = 0;
+            carry += 1;
+        }
+        if carry == k {
+            return (found, true);
+        }
+    }
+}
+
+fn make_zebra(rng: &mut SplitMix64, d: u64, steps: &mut Vec<Step>) -> (String, String) {
     let (n, k) = match d {
         1 => (3usize, 2usize),
         2 => (4, 2),
@@ -1161,12 +1426,47 @@ fn make_zebra(rng: &mut SplitMix64, d: u64, _steps: &mut Vec<Step>) -> (String, 
 
         // Ask for a house number (integer) or an attribute (single word); both
         // grade exactly, and alternating stops one answer shape being learned.
+        // Narrowing again, clue by clue, over the whole grid of assignments.
+        let space = perms.len().pow(k as u32);
+        steps.push(Step::new(
+            format!("{k} categories over {n} houses: {space} possible grids before any clue"),
+            space.to_string(),
+        ));
+        // Cap the count: the first clues leave thousands of grids and the exact
+        // figure there is neither interesting nor cheap. What matters is the
+        // shape of the collapse as the clues accumulate.
+        const TRACE_CAP: usize = 500;
+        for ci in 0..cons.len() {
+            let (left, exact) = zebra_count_upto(k, &cons[..=ci], &perms, TRACE_CAP);
+            let text = if exact {
+                format!("After clue ({}): {left} grid(s) still consistent", ci + 1)
+            } else {
+                format!("After clue ({}): still more than {left} grids - keep going", ci + 1)
+            };
+            steps.push(Step::new(text, if exact { left.to_string() } else { format!(">{left}") }));
+        }
+        for c in 0..k {
+            let row: Vec<String> = (0..n)
+                .map(|house| {
+                    let v = (0..n).find(|v| truth[c][*v] == house).unwrap();
+                    format!("house {}: {}", house + 1, ZEBRA_CATS[c].1[v])
+                })
+                .collect();
+            steps.push(Step::new(
+                format!("Solved {} row - {}", ZEBRA_CATS[c].0, row.join(", ")),
+                row.join("; "),
+            ));
+        }
         let cat = rng.range(0, k as u64 - 1) as usize;
         let val = rng.range(0, n as u64 - 1) as usize;
         if rng.chance(50) {
             q.push_str(&format!(
                 " In which house is {}? Answer with the house number.",
                 ZEBRA_CATS[cat].1[val]
+            ));
+            steps.push(Step::new(
+                format!("{} is in house {}", ZEBRA_CATS[cat].1[val], truth[cat][val] + 1),
+                (truth[cat][val] + 1).to_string(),
             ));
             return (q, (truth[cat][val] + 1).to_string());
         }
@@ -1176,6 +1476,10 @@ fn make_zebra(rng: &mut SplitMix64, d: u64, _steps: &mut Vec<Step>) -> (String, 
             " Which {} is in house {}? Answer with the single word.",
             ZEBRA_CATS[cat].0,
             pos + 1
+        ));
+        steps.push(Step::new(
+            format!("The {} in house {} is {}", ZEBRA_CATS[cat].0, pos + 1, ZEBRA_CATS[cat].1[target]),
+            ZEBRA_CATS[cat].1[target].to_string(),
         ));
         return (q, ZEBRA_CATS[cat].1[target].to_string());
     }
@@ -1669,7 +1973,7 @@ mod step_tests {
     /// Families whose generators record their solution path. Adding a family
     /// here without instrumenting it fails loudly, rather than silently
     /// shipping empty supervision.
-    const INSTRUMENTED: &[Family] = &[Family::ModPow, Family::Crt, Family::Recurrence];
+    const INSTRUMENTED: &[Family] = &Family::ALL_INSTRUMENTED;
 
     /// The contract everything else rests on: the last recorded step states the
     /// answer. A trace that wanders off and lands elsewhere is worse than no
@@ -1866,6 +2170,86 @@ mod step_tests {
                             p.id
                         );
                     }
+                }
+            }
+        }
+    }
+
+    /// The bug this exists to prevent: `zebra_solutions` returns as soon as it
+    /// finds a second solution, because all it is asked is whether the answer is
+    /// unique. Used for a narrowing trace it reports "2" when thousands of grids
+    /// remain, teaching that one clue collapses the space. Verified against
+    /// brute force, which shares no early exit.
+    #[test]
+    fn zebra_count_is_a_count_not_a_uniqueness_check() {
+        let perms = permutations(3);
+        let cons = vec![ZCon::At { cat: 0, val: 0, pos: 0 }];
+
+        let mut brute = 0usize;
+        for a in &perms {
+            for b in &perms {
+                let place = vec![a.clone(), b.clone()];
+                if cons.iter().all(|c| zcon_holds(c, &place)) {
+                    brute += 1;
+                }
+            }
+        }
+        assert!(brute > 2, "a single clue should leave many grids, got {brute}");
+
+        let (counted, exact) = zebra_count_upto(2, &cons, &perms, 10_000);
+        assert!(exact, "cap should not bind on a 36-grid space");
+        assert_eq!(counted, brute, "counter disagrees with brute force");
+
+        // And the predicate is deliberately different - documented here so the
+        // two are not swapped again.
+        assert_eq!(
+            zebra_solutions(2, &cons, &perms),
+            2,
+            "zebra_solutions is a uniqueness predicate and short-circuits at 2"
+        );
+    }
+
+    /// Narrowing traces must shrink. A count that rises as evidence accumulates
+    /// is either a wrong count or a wrong order, and either way it is a lesson
+    /// in the reverse of deduction.
+    #[test]
+    fn narrowing_traces_are_monotone() {
+        for (family, prefix) in [
+            (Family::Sat, "After clause "),
+            (Family::Knights, "After statement "),
+            (Family::Zebra, "After clue "),
+        ] {
+            for d in 1..=5u64 {
+                for p in &generate_set(4, &[family], d, 4700 + d) {
+                    let counts: Vec<i64> = p
+                        .steps
+                        .iter()
+                        .filter(|s| s.text.starts_with(prefix))
+                        .map(|s| {
+                            let v = s.value.as_deref().unwrap_or("0");
+                            // ">500" marks a capped count: treat as a lower bound.
+                            v.trim_start_matches('>').parse().unwrap_or(i64::MAX)
+                        })
+                        .collect();
+                    assert!(
+                        !counts.is_empty(),
+                        "{} d{d}: no narrowing steps recorded",
+                        family.name()
+                    );
+                    for w in counts.windows(2) {
+                        assert!(
+                            w[1] <= w[0],
+                            "{} d{d}: candidates grew {} -> {} as clues were added",
+                            family.name(),
+                            w[0],
+                            w[1]
+                        );
+                    }
+                    assert!(
+                        *counts.last().unwrap() >= 1,
+                        "{} d{d}: narrowing ended with no candidates",
+                        family.name()
+                    );
                 }
             }
         }
