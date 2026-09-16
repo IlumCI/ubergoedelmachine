@@ -19,8 +19,24 @@
   Items per model. 60 fits a night; higher is better powered but linearly slower.
 
 .PARAMETER MaxTokens
-  Per-item generation budget. Must stay under the served context (4096) with room
-  for the prompt.
+  Per-item generation budget. Must stay under the served context with room for
+  the prompt.
+
+  Set it ABOVE the ~95th percentile of what the model actually needs, never near
+  the median. Measured 2026-09-16: at 6000 tokens, against a median demand of
+  5,548, two runs of the SAME weights on the SAME questions disagreed on 18 of 40
+  items - and 15 of those 18 flips were an answer crossing the cap, not a change
+  of mind. A budget at the median turns half the set into coin tosses and the
+  eval reports the sampler rather than the model.
+
+  Accuracy then measures reasoning; token counts measure efficiency. Conflating
+  them into accuracy-at-a-tight-budget measures neither.
+
+.PARAMETER Seed
+  Sampling seed, passed to every worker. Fixed by default so a rerun is
+  reproducible and two models face identical dice - which cancels most of the
+  sampling variance from their DIFFERENCE, the quantity actually under test.
+  Vary it deliberately to measure the spread rather than one draw from it.
 
 .PARAMETER Dataset
   Reasoning JSONL to evaluate. Defaults to the W7 generated held-out set.
@@ -72,14 +88,15 @@
 #>
 param(
     [int]$Limit = 60,
-    [int]$MaxTokens = 3000,
-    [int]$Ctx = 4096,
+    [int]$MaxTokens = 16000,
+    [int]$Ctx = 20480,
     [string]$Tag = "",
     [string]$Dataset = "",
     [string[]]$Models = @("base-q4km","student-v1-q4km"),
     [switch]$NoStream,
     [string]$RemoteUrl = "",
-    [int]$Shards = 1
+    [int]$Shards = 1,
+    [int]$Seed = 1234
 )
 $ErrorActionPreference = "Continue"
 $LMS  = "C:\Users\ilum\.lmstudio\bin\lms.exe"
@@ -91,6 +108,18 @@ $out  = "$env:USERPROFILE\models\reasoning"
 # model key no server has, every item fails, and the run looks like a broken
 # tunnel rather than a broken argument. Split here so both call styles agree.
 $Models = $Models | ForEach-Object { $_ -split ',' } | Where-Object { $_.Trim() } | ForEach-Object { $_.Trim() }
+
+# The window has to hold the prompt AND the whole generation. When it does not,
+# neither server errors: LM Studio stops early and Ollama context-shifts, both
+# producing a plausible reply that silently lost its beginning. That is
+# indistinguishable from a wrong answer in the results, so refuse up front.
+$ctxNeeded = $MaxTokens + 1024
+if ($Ctx -lt $ctxNeeded) {
+    Write-Host "-Ctx $Ctx is too small for -MaxTokens $MaxTokens." -ForegroundColor Red
+    Write-Host "Generation plus prompt must fit the window, or the trace is trimmed with no error." -ForegroundColor Red
+    Write-Host "Use -Ctx $ctxNeeded or higher (and match num_ctx on the server)." -ForegroundColor Yellow
+    exit 1
+}
 
 if ($Shards -gt 1 -and -not $RemoteUrl) {
     Write-Host "-Shards needs -RemoteUrl: N concurrent streams need a server holding N contexts," -ForegroundColor Red
@@ -134,6 +163,7 @@ if (-not $Dataset) { $Dataset = "$out\generated-d2-s777.jsonl" }
 $env:DATASET   = $Dataset
 $env:LIMIT     = "$Limit"
 $env:MAX_TOKENS = "$MaxTokens"
+$env:SEED      = "$Seed"
 if ($NoStream) { Remove-Item Env:SAMARITAN_STREAM -ErrorAction SilentlyContinue }
 else           { $env:SAMARITAN_STREAM = "1" }
 Set-Location $repo
