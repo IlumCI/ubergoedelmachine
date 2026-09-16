@@ -8,7 +8,11 @@ second is a capability claim.
 import json, sys, math
 from collections import Counter
 
-BUDGET = 6000  # completion cap the run was given
+# NOTE ON TOKEN COUNTS: reason_eval sums tokens across retry attempts, so a
+# single item can report more than the per-call budget. That makes a cap
+# impossible to infer reliably from the data, so no cap is inferred - the
+# distribution is reported instead, which is what actually distinguishes a model
+# that finishes from one that runs away.
 
 
 def load(path):
@@ -43,13 +47,14 @@ for name, D in ((a_name, A), (b_name, B)):
     ks = Counter(kind(r) for r in D.values())
     n = len(D)
     tok = sorted(int(r["tokens"]) for r in D.values())
-    at_cap = sum(1 for r in D.values() if BUDGET <= int(r["tokens"]) <= BUDGET + 400)
     print(f"{name}:")
     print(f"  accuracy   {ks['ok']}/{n} = {ks['ok']/n:.0%}")
     print(f"  truncated  {ks['truncated']}  (conf 0.5, ran out of room)")
     print(f"  wrong      {ks['wrong']}  (finished and got it wrong)")
-    print(f"  median tok {tok[len(tok)//2]}   items landing within 400 of the "
-          f"{BUDGET} cap: {at_cap}")
+    p90 = tok[int(len(tok) * 0.9)]
+    print(f"  median tok {tok[len(tok)//2]}   p90 {p90}   max {tok[-1]}")
+    runaway = sum(1 for t in tok if t > 3 * tok[len(tok) // 2])
+    print(f"  runaway (>3x median): {runaway}  - a model that will not terminate")
     print()
 
 # McNemar on the matched items: only the disagreements carry information.
