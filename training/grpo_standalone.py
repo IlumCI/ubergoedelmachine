@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -122,6 +123,35 @@ def policy_gradient_loss(
 # ------------------------------------------------------------------ reward ---
 
 
+def check_grader(grader_cmd: str) -> None:
+    """Fail loudly when the grader command cannot run at all.
+
+    shell=True on a path that does not exist exits 127 with EMPTY stdout, which
+    arrives as "0 verdicts" - indistinguishable from a grader that ran and
+    disagreed. The usual cause is a rebuilt working tree: re-extracting the
+    bundle deletes target/, so a previously-good absolute path silently stops
+    existing while the variable holding it does not.
+    """
+    # shlex, not split(): a naive split breaks any path containing a space and
+    # reports a "missing" binary that is sitting right there.
+    import shlex
+    parts = shlex.split(grader_cmd, posix=(os.name != "nt"))
+    if not parts:
+        sys.exit("--grader is empty")
+    first = parts[0]
+    if "/" in first or "\\" in first:
+        from pathlib import Path as _P
+        if not _P(first).exists():
+            sys.exit(
+                f"grader not found: {first}\n"
+                "The binary is gone but the path is not - usually because the "
+                "bundle was re-extracted, which removes target/. Rebuild it "
+                "(the cell that runs cargo build) and try again."
+            )
+        if not os.access(first, os.X_OK):
+            sys.exit(f"grader is not executable: {first}")
+
+
 def grade(grader_cmd: str, items: list) -> list[bool]:
     """Score (given, gold, kind) triples through the harness's Rust grader.
 
@@ -152,9 +182,13 @@ def grade(grader_cmd: str, items: list) -> list[bool]:
             verdicts.append(False)
     if len(verdicts) != len(items):
         # Never silently misalign rewards with completions - that trains noise.
+        # Print what the grader actually said. Swallowing stderr here is what
+        # made a missing binary look like a disagreeing one.
+        detail = (proc.stderr or "").strip()[-400:]
         print(
             f"warning: grader returned {len(verdicts)} verdicts for {len(items)} "
-            "completions; scoring this group 0",
+            f"completions (exit {proc.returncode}); scoring this group 0"
+            + (f"\n  grader said: {detail}" if detail else "\n  grader said nothing"),
             file=sys.stderr,
         )
         return [False] * len(items)
@@ -271,6 +305,7 @@ def main() -> None:
 
     # Prove the reward path BEFORE any GPU time. A reward function that silently
     # returns 0 trains the model to do nothing, slowly and expensively.
+    check_grader(args.grader)
     kind = rows[0].get("answer_kind", "exactMatch")
     probe = [
         ("<think>x</think>\nAnswer: " + rows[0]["answer"], rows[0]["answer"], kind),
