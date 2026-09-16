@@ -231,7 +231,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-prompt", type=int, default=2048)
     p.add_argument("--generations", type=int, default=8,
                    help="completions per prompt; a group needs SPREAD to teach anything")
-    p.add_argument("--steps", type=int, default=200)
+    # Rollouts dominate, and without vLLM they are plain HF generate: 8 completions
+    # of up to 8k tokens is ~65k tokens per step, so expect MINUTES per step rather
+    # than seconds. 40 steps is a first run that shows whether reward moves; it is
+    # not a finished model. Raise it once the loop is proven.
+    p.add_argument("--steps", type=int, default=40)
     p.add_argument("--lr", type=float, default=5e-6)
     p.add_argument("--rank", type=int, default=16)
     p.add_argument("--alpha", type=int, default=16)
@@ -299,7 +303,15 @@ def main() -> None:
         ),
     )
     model.print_trainable_parameters()
-    model.config.use_cache = True
+
+    # Activation memory is the binding constraint in the backward pass: a full
+    # forward WITH gradients over prompt plus up to 8k completion tokens does not
+    # fit alongside the weights and the generation KV cache otherwise. Checkpointing
+    # trades recomputation for memory, which is the right trade when the alternative
+    # is not running.
+    model.gradient_checkpointing_enable()
+    model.enable_input_require_grads()   # or checkpointing detaches the LoRA graph
+    model.config.use_cache = True        # keep KV caching for generation
 
     opt = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad], lr=args.lr
@@ -321,7 +333,11 @@ def main() -> None:
         prompt_len = enc.input_ids.shape[1]
 
         # --- rollouts: G samples from the same prompt --------------------------
+        # Generation wants the KV cache; the checkpointed training forward below
+        # cannot use it. Toggling explicitly beats letting transformers warn and
+        # change the setting underneath us.
         model.eval()
+        model.config.use_cache = True
         with torch.no_grad():
             out = model.generate(
                 **enc,
@@ -358,6 +374,7 @@ def main() -> None:
 
         # --- policy gradient ---------------------------------------------------
         model.train()
+        model.config.use_cache = False   # incompatible with gradient checkpointing
         opt.zero_grad(set_to_none=True)
         total = 0.0
         for i in range(args.generations):
