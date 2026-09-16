@@ -79,16 +79,27 @@ def parse_args() -> argparse.Namespace:
              "Point this at a PREBUILT binary for training - the default re-enters "
              "cargo once per batch",
     )
-    p.add_argument("--max-seq-len", type=int, default=8192)
-    # Measured, not guessed: on generated d3 the base needs a median of 5,636
-    # tokens to reach an answer, and NONE of the sampled replies finished inside
-    # 2,048. A budget below what the model actually needs truncates every
-    # rollout, so every reward is 0, every group is flat, and GRPO's advantage -
-    # which is purely relative WITHIN a group - is identically zero. That trains
-    # nothing, for hours of paid GPU. Keep this at or above the eval budget.
-    p.add_argument("--max-completion", type=int, default=6144,
-                   help="tokens per rollout; the binding cost of GRPO. Must exceed "
-                        "the model's typical solution length or all rewards are 0")
+    p.add_argument("--max-seq-len", type=int, default=10240)
+    # Set from the demand curve, not from a round number. Across 120 graded
+    # generated-d3 answers (base + two student runs):
+    #
+    #     p50 5,548   p90 8,270   p95 9,549   p99 11,245   max 12,435
+    #
+    # which makes the truncation rate at a given budget:
+    #
+    #     6,144 -> 44%     8,192 -> 10%     12,288 -> 0.8%
+    #
+    # A truncated rollout scores 0, indistinguishable from a wrong one, so at
+    # 6,144 nearly half the reward signal would be "did it fit" rather than "was
+    # it right" - two objectives silently blended into one number. That is the
+    # same error that made two runs of identical weights disagree on 18 of 40
+    # eval items. 8,192 leaves truncation a clear minority at ~33% more rollout
+    # cost than 6,144; raise it further if the reward-health line reports
+    # cut-offs.
+    p.add_argument("--max-completion", type=int, default=8192,
+                   help="tokens per rollout; the binding cost of GRPO. Keep it above "
+                        "the ~90th percentile of solution length, or the reward "
+                        "measures truncation instead of correctness")
     p.add_argument("--generations", type=int, default=8,
                    help="rollouts per prompt; GRPO needs >1 to have a group to rank, "
                         "and needs a MIXED group to have any gradient")
