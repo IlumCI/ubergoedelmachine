@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """GRPO on verifiable rewards - the lever SFT distillation could not pull.
 
-The distillation run taught the student the teacher's *style*: it reached the
-same answers in 27% fewer tokens, which at a fixed budget read as +20pp accuracy.
-But when the budget was lifted the base recovered 25/26 of its failures, so
-imitation bought efficiency, not capability. That is what imitation buys.
+The distillation run was supposed to buy efficiency. Measured cleanly on
+2026-09-16, it cost capability: the 185-trace student scores 30/40 against the
+base's 39/40 (McNemar p=0.012), and it is not more concise - p90 of 16,267
+tokens against 6,206, running past 16k on nine of forty items where the base
+never exceeds 7,121. It did not learn to be brief; it lost the ability to stop.
+The earlier +20pp came from a 6,000-token cap clipping the base's longer but
+correct traces. That is what imitation buys, and why this file exists.
 
 GRPO rewards being RIGHT rather than sounding like the teacher, and that is the
 technique behind every small model that actually gained reasoning ability. Three
@@ -20,6 +23,10 @@ things this project already has make it runnable:
     construction, so the model cannot be scored on what it memorised.
   * verified headroom: the base solves these when given tokens, so the reward is
     neither all-zero (nothing to learn from) nor all-one (nothing to push on).
+
+TRAIN THE BASE, not the SFT student - see --init-adapter. A runaway rollout
+scores 0 under a verifiable reward, so GRPO punishes non-termination by
+construction, which is exactly the defect distillation introduced.
 
 Usage:
     python training/grpo_reasoning.py generated-d3.jsonl \
