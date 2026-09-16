@@ -37,6 +37,7 @@ import argparse
 import json
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 # Must match the prompt the model is EVALUATED under, or training optimises one
@@ -360,6 +361,9 @@ def main() -> None:
         # change the setting underneath us.
         model.eval()
         model.config.use_cache = True
+        print(f"step {step:>4}  generating {gens} x <={args.max_new} tok "
+              f"({row['domain']}) ...", end="", flush=True)
+        t_gen = time.time()
         # OOM is a survivable condition, not the end of the run. The KV cache
         # scales with the group size, so halving it is the one knob that reliably
         # helps - and a smaller group still teaches something, where a crashed run
@@ -390,6 +394,9 @@ def main() -> None:
             continue
         completions = out[:, prompt_len:]
         texts = tok.batch_decode(completions, skip_special_tokens=True)
+        n_tok = int((completions != tok.pad_token_id).sum())
+        print(f" {n_tok:,} tok in {time.time()-t_gen:.0f}s, grading ...",
+              end="", flush=True)
 
         # --- reward ------------------------------------------------------------
         gold, kind = row["answer"], row.get("answer_kind", "exactMatch")
@@ -418,8 +425,8 @@ def main() -> None:
         # A flat group carries no information; skip the backward pass entirely
         # rather than spending it on a zero gradient.
         if all(a == 0.0 for a in advantages):
-            print(f"step {step:>4}  reward {sum(rewards)/len(rewards):.2f}  "
-                  f"(unanimous - skipped)", flush=True)
+            print(f" reward {sum(rewards)/len(rewards):.2f} (unanimous - "
+                  "no gradient, skipped)", flush=True)
             continue
 
         # --- policy gradient ---------------------------------------------------
@@ -453,9 +460,9 @@ def main() -> None:
             [p for p in model.parameters() if p.requires_grad], 1.0
         )
         opt.step()
-        print(f"step {step:>4}  reward {sum(rewards)/len(rewards):.2f}  "
-              f"loss {total:+.4f}  adv {min(advantages):+.2f}..{max(advantages):+.2f}",
-              flush=True)
+        print(f" reward {sum(rewards)/len(rewards):.2f}  loss {total:+.4f}  "
+              f"adv {min(advantages):+.2f}..{max(advantages):+.2f}  "
+              f"[{time.time()-t_gen:.0f}s]", flush=True)
 
         if args.save_every and (step + 1) % args.save_every == 0:
             args.output.mkdir(parents=True, exist_ok=True)
