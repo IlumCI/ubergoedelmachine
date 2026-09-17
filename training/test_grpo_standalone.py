@@ -17,6 +17,7 @@ from grpo_standalone import (  # noqa: E402
     policy_gradient_loss,
     reward_health,
     sequence_logprob,
+    shaped_rewards,
 )
 
 # --------------------------------------------------------------- advantages ---
@@ -137,5 +138,46 @@ assert not msg.startswith("***"), f"3-in-10 should be workable: {msg}"
 print("3/10 mixed -> proceeds")
 
 print("reward_health separates truncation from difficulty, and counts per group")
+
+# Shaping changes what "unanimous" means: a group of eight wrong answers that
+# reached different distances along the path DOES carry a gradient now, and
+# counting verdicts instead of rewards would call it dead and abort the run.
+allwrong = shaped_rewards([(False, r) for r in (1.0, 0.75, 0.5, 0.25)], 0.25)
+msg = reward_health([DONE] * 40, [allwrong] * 10, 8192)
+assert not msg.startswith("***"), f"shaped failures carry gradient: {msg}"
+print("8 wrong answers at different depths -> healthy, not flat")
+
+# ------------------------------------------------------------------ shaping ---
+
+# THE invariant. If partial credit could outrank correctness, the model would
+# learn to emit plausible intermediate numbers and never commit to an answer -
+# and the reward curve would rise the whole time.
+best_wrong = max(shaped_rewards([(False, 1.0)], 0.25))
+worst_right = min(shaped_rewards([(True, 0.0)], 0.25))
+assert best_wrong < worst_right, (
+    f"a perfect wrong answer must score below a sloppy right one: "
+    f"{best_wrong} vs {worst_right}"
+)
+print(f"best wrong {best_wrong:.2f} < worst right {worst_right:.2f}")
+
+# Partial credit ranks failures by how far they got.
+r = shaped_rewards([(False, 0.0), (False, 0.5), (False, 1.0)], 0.25)
+assert r[0] < r[1] < r[2], f"deeper progress must score higher: {r}"
+adv = group_advantages(r)
+assert adv[0] < 0 < adv[2], f"an all-wrong group now carries a gradient: {adv}"
+print(f"all-wrong group -> rewards {r} -> advantages {[round(a, 2) for a in adv]}")
+
+# Correct completions are NOT shaped. Among answers that are all right there is
+# no evidence one is better, and ranking them by how closely they matched the
+# generator's route would teach route-imitation for no gain in correctness.
+assert shaped_rewards([(True, 0.0), (True, 1.0)], 0.25) == [1.0, 1.0]
+assert group_advantages(shaped_rewards([(True, 0.2), (True, 0.9)], 0.25)) == [0.0, 0.0]
+print("all-correct group stays flat -> retired, budget moves elsewhere")
+
+# A problem too shallow to have anchors returns None, and must not become a
+# silent zero that outranks nothing - it simply falls back to binary.
+assert shaped_rewards([(False, None), (True, None)], 0.25) == [0.0, 1.0]
+assert shaped_rewards([(False, 1.0), (True, 1.0)], 0.0) == [0.0, 1.0], "--shaping 0 is binary"
+print("no anchors, or --shaping 0 -> plain binary reward")
 
 print("\nall GRPO maths verified - no GPU, no model, no framework")

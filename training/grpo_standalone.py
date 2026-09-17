@@ -152,8 +152,49 @@ def check_grader(grader_cmd: str) -> None:
             sys.exit(f"grader is not executable: {first}")
 
 
-def grade(grader_cmd: str, items: list) -> list[bool]:
-    """Score (given, gold, kind) triples through the harness's Rust grader.
+def shaped_rewards(
+    verdicts: list[tuple[bool, float | None]], shaping: float
+) -> list[float]:
+    """Correctness, plus partial credit among the completions that got it wrong.
+
+    WHY. A binary reward carries no gradient when the whole group agrees, and on
+    this curriculum it usually does: a 40-step run on d3 produced one update,
+    because eight rollouts on a problem the model can do come back eight-correct
+    and on one it cannot come back eight-wrong. But eight wrong answers are not
+    equally wrong - one may have derived four of the five intermediate quantities
+    before losing the thread. `step_recall` measures that against the generator's
+    own recorded path, so the doomed group becomes a ranking instead of a tie.
+
+    Partial credit applies ONLY to failures, which is the point rather than an
+    optimisation. Among completions that are all correct there is no evidence one
+    is better, and preferring whichever happened to match the generator's route
+    would teach route-imitation with no gain in correctness. An all-correct group
+    stays flat, gets retired, and its rollout budget goes somewhere it can learn.
+
+    The invariant: recall is in [0,1] and shaping is well below 1, so the best
+    possible wrong answer scores below the worst possible right one. Partial
+    credit reorders failures; it never outranks being right.
+    """
+    out = []
+    for ok, recall in verdicts:
+        if ok:
+            out.append(1.0)
+        elif shaping and recall is not None:
+            out.append(shaping * recall)
+        else:
+            out.append(0.0)
+    return out
+
+
+def grade(grader_cmd: str, items: list) -> list[tuple[bool, float | None]]:
+    """Score completions through the harness's Rust grader.
+
+    `items` are (given, row) pairs: the grader needs the question and the
+    generator's recorded steps as well as the gold answer, because it scores
+    partial progress along that path as well as the final answer.
+
+    Returns (correct, step_recall) per item, where recall is None when the
+    problem has too few distinct derived quantities to score progress against.
 
     One subprocess per group rather than per completion: the cost is process
     startup, and a step grades every rollout at once.
@@ -161,7 +202,14 @@ def grade(grader_cmd: str, items: list) -> list[bool]:
     if not items:
         return []
     payload = "\n".join(
-        json.dumps({"given": g, "answer": a, "answer_kind": k}) for g, a, k in items
+        json.dumps({
+            "given": g,
+            "answer": row["answer"],
+            "answer_kind": row.get("answer_kind", "exactMatch"),
+            "question": row.get("question", ""),
+            "steps": row.get("steps") or [],
+        })
+        for g, row in items
     )
     try:
         proc = subprocess.run(
@@ -170,16 +218,21 @@ def grade(grader_cmd: str, items: list) -> list[bool]:
         )
     except subprocess.TimeoutExpired:
         print("warning: grader timed out; scoring this group 0", file=sys.stderr)
-        return [False] * len(items)
+        return [(False, None)] * len(items)
     verdicts = []
     for line in proc.stdout.splitlines():
         line = line.strip()
         if not line:
             continue
         try:
-            verdicts.append(bool(json.loads(line).get("correct", False)))
-        except json.JSONDecodeError:
-            verdicts.append(False)
+            rec = json.loads(line)
+            recall = rec.get("step_recall")
+            verdicts.append((
+                bool(rec.get("correct", False)),
+                float(recall) if recall is not None else None,
+            ))
+        except (json.JSONDecodeError, TypeError, ValueError):
+            verdicts.append((False, None))
     if len(verdicts) != len(items):
         # Never silently misalign rewards with completions - that trains noise.
         # Print what the grader actually said. Swallowing stderr here is what
@@ -191,11 +244,11 @@ def grade(grader_cmd: str, items: list) -> list[bool]:
             + (f"\n  grader said: {detail}" if detail else "\n  grader said nothing"),
             file=sys.stderr,
         )
-        return [False] * len(items)
+        return [(False, None)] * len(items)
     return verdicts
 
 
-def reward_health(texts: list[str], groups: list[list[bool]], budget: int) -> str:
+def reward_health(texts: list[str], groups: list[list[float]], budget: int) -> str:
     """Whether the opening groups carry any gradient, and if not, why.
 
     A run of unanimous groups is not slow progress, it is no progress - and from
@@ -204,7 +257,10 @@ def reward_health(texts: list[str], groups: list[list[bool]], budget: int) -> st
     perfectly mixed set while producing zero advantage everywhere.
     """
     answered = sum(1 for t in texts if "answer:" in t.lower()) / max(len(texts), 1)
-    mixed = sum(1 for g in groups if len(set(g)) > 1)
+    # Spread on the REWARDS, not the verdicts: with step-recall shaping a group
+    # of eight wrong answers carries a gradient whenever they got different
+    # distances along the path, and counting booleans would call that dead.
+    mixed = sum(1 for g in groups if g and max(g) - min(g) > 1e-9)
     rate = mixed / max(len(groups), 1)
     # A THIRD, not one. `if mixed:` passed a run where 1 group in 10 had spread,
     # and it went on to spend five hours producing a single gradient step -
@@ -222,8 +278,9 @@ def reward_health(texts: list[str], groups: list[list[bool]], budget: int) -> st
             f"and {answered:.0%} of rollouts finished. The problems are mostly "
             "SOLVED-OR-DOOMED rather than uncertain - 8 rollouts on an easy item "
             "give 8 correct, on a hard one 8 wrong, and neither teaches anything. "
-            "Mix in harder DIFFICULTY, or select problems that actually produce "
-            "spread."
+            "Check --shaping is non-zero and the dataset carries 'steps': partial "
+            "credit is what turns a doomed group into a ranking. Otherwise mix in "
+            "harder DIFFICULTY, or select problems that actually produce spread."
         )
     if answered < 0.5:
         return (
@@ -308,6 +365,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--min-generations", type=int, default=2,
                    help="on CUDA OOM the group is halved and retried, down to this; "
                         "a smaller group still teaches something, a dead run does not")
+    p.add_argument(
+        "--shaping", type=float, default=0.25,
+        help="weight on step-recall partial credit for WRONG completions "
+             "(0 disables). Must stay below 1 so a wrong answer can never "
+             "outscore a right one.",
+    )
+    p.add_argument(
+        "--smoke", action="store_true",
+        help="after the first group, force one backward pass with synthetic "
+             "advantages and stop. Proves checkpointing + LoRA + masking "
+             "actually produce a gradient - the part a flat-group smoke test "
+             "never touches.",
+    )
     p.add_argument("--dry-run", action="store_true",
                    help="verify the dataset and reward path, then stop before the GPU")
     return p.parse_args()
@@ -324,18 +394,32 @@ def main() -> None:
     # Prove the reward path BEFORE any GPU time. A reward function that silently
     # returns 0 trains the model to do nothing, slowly and expensively.
     check_grader(args.grader)
-    kind = rows[0].get("answer_kind", "exactMatch")
     probe = [
-        ("<think>x</think>\nAnswer: " + rows[0]["answer"], rows[0]["answer"], kind),
-        ("<think>x</think>\nAnswer: __definitely_wrong__", rows[0]["answer"], kind),
+        ("<think>x</think>\nAnswer: " + rows[0]["answer"], rows[0]),
+        ("<think>x</think>\nAnswer: __definitely_wrong__", rows[0]),
     ]
-    got = grade(args.grader, probe)
+    got = [ok for ok, _ in grade(args.grader, probe)]
     if got != [True, False]:
         sys.exit(
             f"grader sanity check failed: expected [True, False], got {got}.\n"
             f"Command was: {args.grader}\nFix this first - a broken reward trains nothing."
         )
     print(f"grader OK via: {args.grader}")
+
+    # Shaping is only as good as the traces behind it, and a dataset generated
+    # before the W7 families recorded their solution paths has none. Say so here
+    # rather than letting every recall come back None and the run look flat for
+    # an unrelated reason.
+    if args.shaping:
+        traced = sum(1 for r in rows if r.get("steps"))
+        print(f"step traces: {traced}/{len(rows)} problems, shaping weight {args.shaping}")
+        if traced == 0:
+            sys.exit(
+                "--shaping is on but no problem carries 'steps'. This dataset was "
+                "generated before the families recorded their solution paths - "
+                "regenerate it, or pass --shaping 0 to train on binary reward "
+                "alone (and expect unanimous groups)."
+            )
 
     if args.dry_run:
         print("--dry-run: dataset and reward path verified; stopping before model load.")
@@ -469,14 +553,14 @@ def main() -> None:
               end="", flush=True)
 
         # --- reward ------------------------------------------------------------
-        gold, kind = row["answer"], row.get("answer_kind", "exactMatch")
-        verdicts = grade(args.grader, [(t, gold, kind) for t in texts])
-        rewards = [1.0 if v else 0.0 for v in verdicts]
+        verdicts = grade(args.grader, [(t, row) for t in texts])
+        rewards = shaped_rewards(verdicts, args.shaping)
         advantages = group_advantages(rewards)
+        n_right = sum(1 for ok, _ in verdicts if ok)
 
         if len(seen_groups) < 10:
             seen_texts += texts
-            seen_groups.append(verdicts)
+            seen_groups.append(rewards)
             if len(seen_groups) == 10:
                 msg = reward_health(seen_texts, seen_groups, args.max_new)
                 dead = msg.startswith("***")
@@ -492,13 +576,26 @@ def main() -> None:
                           file=sys.stderr, flush=True)
                     sys.exit(2)
 
+        # --smoke: the old smoke test generated two 512-token completions, both
+        # truncated, got a flat group, skipped the backward pass and printed
+        # success. It proved generation and grading and never once touched the
+        # gradient path - which is the part most likely to break, because
+        # checkpointing, LoRA and masking all interact there. Synthetic
+        # advantages force that path to run. It is deliberately NOT learning:
+        # the numbers are made up, and the adapter it produces is discarded.
+        if args.smoke:
+            advantages = [1.0 if i % 2 == 0 else -1.0 for i in range(len(texts))]
+            print(f"\n--smoke: forcing one backward with synthetic advantages "
+                  f"{advantages} (not learning - testing the machinery)", flush=True)
+
         # A flat group carries no information; skip the backward pass entirely
         # rather than spending it on a zero gradient.
         attempts += 1
         if all(a == 0.0 for a in advantages):
             retired.add(idx)
-            print(f" reward {sum(rewards)/len(rewards):.2f} (unanimous - no "
-                  f"gradient; {trained}/{args.steps} trained, "
+            print(f" {n_right}/{len(verdicts)} right, reward "
+                  f"{sum(rewards)/len(rewards):.2f} (unanimous - no gradient; "
+                  f"{trained}/{args.steps} trained, "
                   f"{attempts}/{max_attempts} tried)", flush=True)
             continue
         trained += 1
@@ -531,11 +628,32 @@ def main() -> None:
             loss.backward()
             total += float(loss)
 
-        torch.nn.utils.clip_grad_norm_(
+        gnorm = torch.nn.utils.clip_grad_norm_(
             [p for p in model.parameters() if p.requires_grad], 1.0
         )
         opt.step()
-        print(f" reward {sum(rewards)/len(rewards):.2f}  loss {total:+.4f}  "
+
+        if args.smoke:
+            # A zero gradient norm here means the backward ran and reached
+            # nothing: enable_input_require_grads missing, checkpointing having
+            # detached the LoRA graph, or every token masked out. That failure is
+            # silent in a real run - the loss prints, the step counts, and the
+            # adapter never moves.
+            if not float(gnorm) > 0:
+                sys.exit(
+                    f"--smoke FAILED: loss {total:+.4f} but gradient norm is "
+                    f"{float(gnorm)}. The backward pass reached no trainable "
+                    "parameter. Do not start a real run."
+                )
+            print(f"\n--smoke PASSED: gradient norm {float(gnorm):.4f} reached "
+                  f"the LoRA weights; backward, checkpointing and masking all "
+                  f"work. Nothing saved.", flush=True)
+            return
+        # Correct count and mean reward are now different numbers: with shaping a
+        # group can move the policy while getting nothing right, which is exactly
+        # the case this was built for. Printing only the mean would hide it.
+        print(f" {n_right}/{len(verdicts)} right, reward "
+              f"{sum(rewards)/len(rewards):.2f}  loss {total:+.4f}  "
               f"adv {min(advantages):+.2f}..{max(advantages):+.2f}  "
               f"[{time.time()-t_gen:.0f}s]", flush=True)
 
