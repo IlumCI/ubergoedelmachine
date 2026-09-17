@@ -371,6 +371,14 @@ fn make_crt(rng: &mut SplitMix64, d: u64, steps: &mut Vec<Step>) -> (String, Str
             }
         }
         let Some(gold) = gold else { continue };
+        // Reject a draw whose answer is one of the numbers already on the page.
+        // `x = 5 (mod 7), x = 19 (mod 24)` has the answer 19, because 19 happens
+        // to satisfy the first congruence too - so it is answerable by copying a
+        // remainder out of the question without merging anything. Four such
+        // problems turned up in 108 draws.
+        if rems.contains(&gold) || moduli.contains(&gold) {
+            continue;
+        }
         let mut clauses: Vec<String> = vec![format!(
             "leaves a remainder of {} when divided by {}",
             rems[0], moduli[0]
@@ -396,6 +404,17 @@ fn make_crt(rng: &mut SplitMix64, d: u64, steps: &mut Vec<Step>) -> (String, Str
                 format!("{r} mod {m}"),
             ));
         }
+        // Stated up front because it is derivable up front, and because every
+        // other derived quantity in this trace arrives only at the merge - a
+        // rollout that has got this far has done something, and without it a
+        // half-finished attempt is indistinguishable from no attempt.
+        steps.push(Step::new(
+            format!(
+                "The moduli are pairwise coprime, so the solution is unique mod \
+                 their product {product}"
+            ),
+            product.to_string(),
+        ));
         let mut acc_mod = moduli[0];
         let mut acc = rems[0];
         steps.push(Step::new(
@@ -405,9 +424,19 @@ fn make_crt(rng: &mut SplitMix64, d: u64, steps: &mut Vec<Step>) -> (String, Str
         for i in 1..want {
             let (m, r) = (moduli[i], rems[i]);
             let mut x = acc;
+            let mut t = 0u64;
             while x % m != r {
                 x += acc_mod;
+                t += 1;
             }
+            // How far through the residue class the solution sits. The textbook
+            // route computes this same number as (r - acc) * acc_mod^-1 mod m,
+            // so it is an intermediate BOTH routes produce - which is what makes
+            // it fair to score a partial solution against.
+            steps.push(Step::new(
+                format!("x = {acc} + t*{acc_mod} with x = {r} (mod {m}) needs t = {t}"),
+                t.to_string(),
+            ));
             acc = x;
             acc_mod *= m;
             steps.push(Step::new(
@@ -416,6 +445,14 @@ fn make_crt(rng: &mut SplitMix64, d: u64, steps: &mut Vec<Step>) -> (String, Str
                      now fixed mod {acc_mod}"
                 ),
                 acc.to_string(),
+            ));
+            // The combined modulus is derived, never given. With two congruences
+            // the merged solution IS the answer, so without this the whole trace
+            // reduces to one scoreable value - the answer itself, which tells a
+            // partial attempt apart from nothing at all.
+            steps.push(Step::new(
+                format!("The merged congruence is unique mod {acc_mod}"),
+                acc_mod.to_string(),
             ));
         }
         steps.push(Step::new(
@@ -427,33 +464,80 @@ fn make_crt(rng: &mut SplitMix64, d: u64, steps: &mut Vec<Step>) -> (String, Str
 }
 
 fn make_recurrence(rng: &mut SplitMix64, d: u64, steps: &mut Vec<Step>) -> (String, String) {
-    let m = rng.range(5, 20 + 40 * d);
-    let p = rng.range(2, 9);
-    let q = rng.range(0, m - 1);
-    let x0 = rng.range(0, m - 1);
-    let k = match d {
-        1 | 2 => rng.range(5, 30),
-        3 => rng.range(1_000, 100_000),
-        _ => rng.range(100_000_000, 2_000_000_000),
+    // The draw has to be rejected, not just recorded. x -> (p·x + q) mod m
+    // collapses almost immediately when gcd(p, m) is large: sampled at d=4, four
+    // problems in a row had cycle lengths 1, 2, 2 and 4, and the one with length
+    // 1 had a(k) = a(1) - an answer copied straight out of the question. The
+    // family's whole lesson is that an astronomical k indexes into a cycle, and a
+    // cycle of length 1 teaches the opposite.
+    let min_lambda = if d <= 2 { 4 } else { 8 };
+    let (m, p, q, x0, k, gold, mu, lambda) = {
+        let mut drawn = None;
+        for _attempt in 0..500 {
+            let m = rng.range(12, 20 + 40 * d);
+            let p = rng.range(2, 9);
+            let q = rng.range(0, m - 1);
+            let x0 = rng.range(0, m - 1);
+            let k = match d {
+                1 | 2 => rng.range(5, 30),
+                3 => rng.range(1_000, 100_000),
+                _ => rng.range(100_000_000, 2_000_000_000),
+            };
+            let (mu, lambda) = recurrence_cycle(x0, p, q, m);
+            if lambda < min_lambda {
+                continue;
+            }
+            let gold = recurrence_at(x0, p, q, m, k);
+            // An answer equal to the first term is answerable by reading the
+            // question, whatever the cycle looks like.
+            if gold == x0 {
+                continue;
+            }
+            drawn = Some((m, p, q, x0, k, gold, mu, lambda));
+            break;
+        }
+        drawn.unwrap_or_else(|| {
+            panic!("recurrence: no cycle of length >= {min_lambda} in 500 draws at difficulty {d}")
+        })
     };
     let question = format!(
         "A sequence is defined by a(1) = {x0}, and a(n+1) = ({p}*a(n) + {q}) mod {m} for n >= 1. \
          What is a({k})?"
     );
-    let gold = recurrence_at(x0, p, q, m, k);
 
     // The lesson is that a linear map on Z_m must cycle within m states, so a(k)
     // for astronomical k is an index into that cycle. Record the cycle's shape,
     // not two billion iterations.
-    let (mu, lambda) = recurrence_cycle(x0, p, q, m);
     steps.push(Step::new(
         format!("The map x -> ({p}x + {q}) mod {m} has only {m} possible states, so it must cycle"),
         m.to_string(),
     ));
+    // Separate integers, not "mu=3, lambda=17". A compound string is unscoreable
+    // as a partial result, and the cycle length is the one quantity every correct
+    // route has to find - a solver who has it has done the real work, whatever
+    // they then do with it.
     steps.push(Step::new(
-        format!("It enters the cycle after {mu} term(s), and the cycle length is {lambda}"),
-        format!("mu={mu}, lambda={lambda}"),
+        format!("The orbit enters its cycle after {mu} term(s)"),
+        mu.to_string(),
     ));
+    steps.push(Step::new(
+        format!("The cycle length is {lambda}"),
+        lambda.to_string(),
+    ));
+    // The cycle's MEMBERS, not just its shape. When the map is a bijection the
+    // orbit enters its cycle at a(1), which the question states - so a trace
+    // recording only the length and the entry point has exactly one derived
+    // quantity in it, the answer itself, and every failed rollout ties. The
+    // members are what a solver actually computes, and each one is independently
+    // checkable. Capped, because a long cycle would bury the rest of the trace.
+    let mut x = recurrence_at(x0, p, q, m, mu + 1);
+    for j in 0..lambda.min(12) {
+        steps.push(Step::new(
+            format!("Cycle term {j}: a({}) = {x}", mu + 1 + j),
+            x.to_string(),
+        ));
+        x = (p * x + q) % m;
+    }
     let idx = k - 1;
     if idx >= mu {
         let off = mu + (idx - mu) % lambda;
@@ -827,6 +911,16 @@ fn make_automata(rng: &mut SplitMix64, d: u64, steps: &mut Vec<Step>) -> (String
             steps.push(Step::new(
                 format!("After {j} symbol(s): {}", fmt_counts(&counts)),
                 fmt_counts(&counts),
+            ));
+            // The accepting subtotal after j symbols is this same question asked
+            // of length j, so it is a plain derived integer rather than a state
+            // vector - and it is the one number that says how far along the
+            // recurrence a rollout actually got. Without it the whole trace is
+            // compound strings, and every attempt scores identically.
+            let acc_j: u64 = (0..n).filter(|i| accepting[*i]).map(|i| counts[i]).sum();
+            steps.push(Step::new(
+                format!("Of those, {acc_j} end in an accepting state"),
+                acc_j.to_string(),
             ));
         }
         let acc_sum: u64 = (0..n).filter(|i| accepting[*i]).map(|i| counts[i]).sum();
@@ -2260,5 +2354,149 @@ mod step_tests {
             .filter(|t| !t.is_empty())
             .filter_map(|t| t.parse().ok())
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod anchor_coverage_tests {
+    use super::*;
+    use samaritan_corpus::solution_anchors;
+    use std::collections::BTreeMap;
+
+    /// Every family must record intermediates a rollout can be scored against.
+    ///
+    /// A trace whose values are compound strings (`"q0=1, q1=0"`, `"mu=1,
+    /// lambda=2"`, `"17 mod 20"`) or single digits is unscoreable: partial credit
+    /// falls back to binary, every failed rollout ties, and the group carries no
+    /// gradient at all. Measured before this was fixed, `crt`, `recurrence` and
+    /// `automata` scored 0%.
+    ///
+    /// Scored with the SAME function the grader uses on real rollouts, via the
+    /// dev-dependency - so tightening the anchor rules moves the generators and
+    /// the reward together instead of silently stranding one.
+    #[test]
+    fn every_family_records_scoreable_intermediates() {
+        let mut per_family: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+        for d in 3..=5u64 {
+            for p in &generate_set(120, &Family::all(), d, 2000 + d) {
+                let values = p.steps.iter().map(|s| s.value.as_deref());
+                let scoreable = solution_anchors(&p.question, values).len() >= 2;
+                let e = p.id.split('-').nth(1).expect("gen-<family>-...").to_string();
+                let slot = per_family.entry(e).or_insert((0, 0));
+                slot.0 += scoreable as usize;
+                slot.1 += 1;
+            }
+        }
+        assert_eq!(per_family.len(), Family::all().len(), "a family went missing");
+
+        // A floor, not the measured rate: the rates move with any change to the
+        // generators, and pinning them would turn an improvement into a failure.
+        // What must never come back is a family at or near zero.
+        for (fam, (ok, n)) in &per_family {
+            assert!(
+                *ok * 100 >= *n * 30,
+                "{fam}: only {ok}/{n} problems have two or more scoreable \
+                 intermediates. Its steps are probably recording compound \
+                 strings or single digits rather than derived quantities."
+            );
+        }
+        let ok: usize = per_family.values().map(|v| v.0).sum();
+        let n: usize = per_family.values().map(|v| v.1).sum();
+        assert!(ok * 100 >= n * 70, "overall coverage {ok}/{n} fell below 70%");
+    }
+
+    /// The recurrence family's whole lesson is that an astronomical index folds
+    /// into a short cycle. A degenerate draw destroys it: sampled at d=4 before
+    /// this guard, four problems running had cycle lengths 1, 2, 2 and 4, and the
+    /// length-1 one had a(k) = a(1) - answerable by copying from the question.
+    #[test]
+    fn recurrence_problems_actually_require_finding_a_cycle() {
+        for d in 1..=5u64 {
+            for p in &generate_set(40, &[Family::Recurrence], d, 5100 + d) {
+                let lambda: u64 = p
+                    .steps
+                    .iter()
+                    .find(|s| s.text.starts_with("The cycle length is"))
+                    .and_then(|s| s.value.as_ref())
+                    .expect("recurrence records its cycle length")
+                    .parse()
+                    .unwrap();
+                let floor = if d <= 2 { 4 } else { 8 };
+                assert!(lambda >= floor, "{}: cycle length {lambda} < {floor}", p.id);
+
+                // "A sequence is defined by a(1) = {x0}, and ..." - the second
+                // number in the question, after the 1 in a(1).
+                let nums: Vec<u64> = p
+                    .question
+                    .split(|c: char| !c.is_ascii_digit())
+                    .filter(|t| !t.is_empty())
+                    .filter_map(|t| t.parse().ok())
+                    .collect();
+                assert_ne!(
+                    p.answer.parse::<u64>().unwrap(),
+                    nums[1],
+                    "{}: the answer is a(1), copyable straight out of the question",
+                    p.id
+                );
+            }
+        }
+    }
+
+    /// A CRT answer that is one of the given remainders was never merged: that
+    /// remainder already satisfied every other congruence, and the problem is
+    /// answerable by copying a number out of the question. Four such draws turned
+    /// up in 108 before this was rejected.
+    #[test]
+    fn crt_answers_are_not_sitting_in_the_question() {
+        for d in 1..=5u64 {
+            for p in &generate_set(40, &[Family::Crt], d, 5300 + d) {
+                let given: Vec<u64> = p
+                    .question
+                    .split(|c: char| !c.is_ascii_digit())
+                    .filter(|t| !t.is_empty())
+                    .filter_map(|t| t.parse().ok())
+                    .collect();
+                let gold: u64 = p.answer.parse().unwrap();
+                assert!(
+                    !given.contains(&gold),
+                    "{}: answer {gold} appears in the question - {}",
+                    p.id,
+                    p.question
+                );
+            }
+        }
+    }
+
+    /// Each accepting subtotal is the same question asked of a shorter length, so
+    /// it is independently checkable - and if it were not, partial credit would
+    /// be rewarding rollouts for reaching wrong numbers.
+    #[test]
+    fn automata_subtotals_count_shorter_strings() {
+        let mut checked = 0;
+        for d in 2..=4u64 {
+            for p in &generate_set(8, &[Family::Automata], d, 5200 + d) {
+                let subtotals: Vec<u64> = p
+                    .steps
+                    .iter()
+                    .filter(|s| s.text.starts_with("Of those,"))
+                    .map(|s| s.value.as_ref().unwrap().parse().unwrap())
+                    .collect();
+                assert!(!subtotals.is_empty(), "{}: no accepting subtotals", p.id);
+                // The last one answers the question as asked.
+                assert_eq!(
+                    *subtotals.last().unwrap(),
+                    p.answer.parse::<u64>().unwrap(),
+                    "{}: final subtotal disagrees with the gold answer",
+                    p.id
+                );
+                // Every subtotal is bounded by the number of strings of that
+                // length - a count that exceeded 2^j would be arithmetic noise.
+                for (j, &c) in subtotals.iter().enumerate() {
+                    assert!(c <= 1u64 << (j + 1), "{}: {c} accepted of 2^{}", p.id, j + 1);
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked >= 100, "only {checked} subtotals exercised");
     }
 }

@@ -49,66 +49,7 @@
 
 use std::io::{BufRead, Write};
 
-use samaritan_corpus::{extract_answer, grade_answer, AnswerKind};
-
-/// At least two digits, optional leading minus, nothing else. Anything with a
-/// space, a letter or an operator in it is a restatement of the problem rather
-/// than a quantity the solver had to derive.
-fn is_anchor_literal(v: &str) -> bool {
-    let digits = v.strip_prefix('-').unwrap_or(v);
-    digits.len() >= 2 && digits.bytes().all(|b| b.is_ascii_digit())
-}
-
-/// Does `needle` occur in `hay` as a whole numeric token?
-///
-/// The preceding character may not be a digit, letter, `.`, `_` or `-`, so
-/// `28` matches neither `128` nor `-28`; the following character may not be a
-/// digit, letter, `.` or `_`, so it does not match inside `28.5` or `283` —
-/// but `337-2` does contain `337`, which is why the two sides differ.
-fn contains_token(hay: &str, needle: &str) -> bool {
-    if needle.is_empty() {
-        return false;
-    }
-    let (h, n) = (hay.as_bytes(), needle.as_bytes());
-    if n.len() > h.len() {
-        return false;
-    }
-    for i in 0..=(h.len() - n.len()) {
-        if &h[i..i + n.len()] != n {
-            continue;
-        }
-        let before_ok = i == 0 || {
-            let c = h[i - 1];
-            !(c.is_ascii_alphanumeric() || c == b'.' || c == b'_' || c == b'-')
-        };
-        let j = i + n.len();
-        let after_ok = j == h.len() || {
-            let c = h[j];
-            !(c.is_ascii_alphanumeric() || c == b'.' || c == b'_')
-        };
-        if before_ok && after_ok {
-            return true;
-        }
-    }
-    false
-}
-
-/// The distinct derived quantities on the generator's path that a solver could
-/// not have copied from the question.
-fn anchors(question: &str, steps: &serde_json::Value) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    let Some(list) = steps.as_array() else {
-        return out;
-    };
-    for s in list {
-        let v = s["value"].as_str().unwrap_or("").trim();
-        if !is_anchor_literal(v) || contains_token(question, v) || out.iter().any(|o| o == v) {
-            continue;
-        }
-        out.push(v.to_string());
-    }
-    out
-}
+use samaritan_corpus::{extract_answer, grade_answer, step_recall, AnswerKind};
 
 fn main() {
     let stdin = std::io::stdin();
@@ -152,16 +93,20 @@ fn main() {
             correct += 1;
         }
 
-        // Recall is measured over the WHOLE reply, thinking block included: the
-        // intermediate quantities live in the working, which `extract_answer`
-        // discards by design.
-        let found = anchors(v["question"].as_str().unwrap_or(""), &v["steps"]);
-        let recall = if found.len() < 2 {
-            serde_json::Value::Null
-        } else {
-            shaped += 1;
-            let hit = found.iter().filter(|a| contains_token(given_raw, a)).count();
-            serde_json::json!(hit as f64 / found.len() as f64)
+        let values: Vec<Option<&str>> = v["steps"]
+            .as_array()
+            .map(|l| l.iter().map(|s| s["value"].as_str()).collect())
+            .unwrap_or_default();
+        let recall = match step_recall(
+            given_raw,
+            v["question"].as_str().unwrap_or(""),
+            values,
+        ) {
+            Some(r) => {
+                shaped += 1;
+                serde_json::json!(r)
+            }
+            None => serde_json::Value::Null,
         };
 
         let rec = serde_json::json!({
@@ -178,46 +123,27 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use samaritan_corpus::step_recall;
 
+    /// The anchor rules themselves are tested in the library. This covers the
+    /// wiring: JSON `steps` in, a number or null out.
     #[test]
-    fn token_match_respects_digit_boundaries() {
-        assert!(contains_token("so x = 28 here", "28"));
-        assert!(contains_token("28", "28"));
-        assert!(contains_token("(28)", "28"));
-        assert!(!contains_token("128", "28"), "must not match a suffix");
-        assert!(!contains_token("283", "28"), "must not match a prefix");
-        assert!(!contains_token("28.5", "28"), "must not match a decimal head");
-        assert!(!contains_token("-28", "28"), "a negative is a different value");
-        assert!(contains_token("337-2", "337"), "subtraction is still an occurrence");
-    }
-
-    #[test]
-    fn anchors_drop_what_a_solver_never_had_to_derive() {
-        let steps = serde_json::json!([
-            {"text": "restate", "value": "17 mod 20"},   // not an integer
-            {"text": "given",   "value": "20"},          // already in the question
-            {"text": "trivial", "value": "1"},           // single digit
-            {"text": "derived", "value": "337"},
-            {"text": "again",   "value": "337"},         // duplicate
-            {"text": "note",    "value": null},
-        ]);
-        let got = anchors("remainder 17 when divided by 20", &steps);
-        assert_eq!(got, vec!["337".to_string()]);
-    }
-
-    #[test]
-    fn recall_counts_distinct_anchors_reached() {
+    fn json_steps_reach_the_scorer() {
         let steps = serde_json::json!([
             {"text": "a", "value": "28"},
             {"text": "b", "value": "56"},
             {"text": "c", "value": "13"},
-            {"text": "d", "value": "99"},
+            {"text": "structural", "value": null},
         ]);
-        let found = anchors("nothing here", &steps);
-        assert_eq!(found.len(), 4);
-        let reply = "first 28, then 56, then I lost the thread";
-        let hit = found.iter().filter(|a| contains_token(reply, a)).count();
-        assert_eq!(hit, 2, "half the path reached");
+        let values: Vec<Option<&str>> =
+            steps.as_array().unwrap().iter().map(|s| s["value"].as_str()).collect();
+        let got = step_recall("first 28, then 56, then I lost it", "nothing here", values);
+        assert_eq!(got, Some(2.0 / 3.0));
+    }
+
+    #[test]
+    fn a_problem_with_no_steps_scores_nothing_rather_than_zero() {
+        let none: Vec<Option<&str>> = Vec::new();
+        assert_eq!(step_recall("anything", "a question", none), None);
     }
 }

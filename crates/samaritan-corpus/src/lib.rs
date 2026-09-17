@@ -619,6 +619,109 @@ impl TestPatterns {
     }
 }
 
+// ------------------------------------------------- partial credit -------
+// A binary correct/incorrect reward carries no gradient when every rollout in a
+// group agrees, and on generated curricula they usually do: eight rollouts on a
+// problem the model can do come back eight-correct, and on one it cannot,
+// eight-wrong. Eight wrong answers are not equally wrong, though - one may have
+// derived most of the intermediate quantities before losing the thread. The
+// generators record their own solution path at construction time, so that
+// difference is measurable with no reward model and no judge.
+//
+// This lives in the library rather than in the grader binary so the generators'
+// own tests can assert their traces are scoreable against the SAME rules that
+// score rollouts. Two copies of these rules would be two oracles.
+
+/// At least two digits, optional leading minus, nothing else.
+///
+/// A value like `"17 mod 20"` or `"q0=1, q1=0"` is a restatement of the problem
+/// state rather than a quantity the solver had to derive, and a single digit
+/// occurs by chance in any long trace.
+pub fn is_anchor_literal(v: &str) -> bool {
+    let digits = v.strip_prefix('-').unwrap_or(v);
+    digits.len() >= 2 && digits.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Does `needle` occur in `hay` as a whole numeric token?
+///
+/// The preceding character may not be a digit, letter, `.`, `_` or `-`, so `28`
+/// matches neither `128` nor `-28`; the following character may not be a digit,
+/// letter, `.` or `_`, so it does not match inside `28.5` or `283` — but
+/// `337-2` does contain `337`, which is why the two sides differ.
+///
+/// The strictness is the point: without it a model learns that sprinkling
+/// plausible digits scores, which is cheaper than reasoning.
+pub fn contains_token(hay: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let (h, n) = (hay.as_bytes(), needle.as_bytes());
+    if n.len() > h.len() {
+        return false;
+    }
+    for i in 0..=(h.len() - n.len()) {
+        if &h[i..i + n.len()] != n {
+            continue;
+        }
+        let before_ok = i == 0 || {
+            let c = h[i - 1];
+            !(c.is_ascii_alphanumeric() || c == b'.' || c == b'_' || c == b'-')
+        };
+        let j = i + n.len();
+        let after_ok = j == h.len() || {
+            let c = h[j];
+            !(c.is_ascii_alphanumeric() || c == b'.' || c == b'_')
+        };
+        if before_ok && after_ok {
+            return true;
+        }
+    }
+    false
+}
+
+/// The distinct derived quantities on a solution path that a solver could not
+/// have copied out of the question.
+///
+/// `values` is each step's recorded value in order, `None` for purely structural
+/// steps. Order is preserved and duplicates dropped, so a path that restates its
+/// result contributes one anchor rather than two.
+pub fn solution_anchors<'a>(
+    question: &str,
+    values: impl IntoIterator<Item = Option<&'a str>>,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for v in values {
+        let v = v.unwrap_or("").trim();
+        if !is_anchor_literal(v) || contains_token(question, v) || out.iter().any(|o| o == v) {
+            continue;
+        }
+        out.push(v.to_string());
+    }
+    out
+}
+
+/// What fraction of the solution path a reply reached, or `None` when the
+/// problem has too few distinct derived quantities to say.
+///
+/// Measured over the WHOLE reply, thinking block included: the intermediate
+/// quantities live in the working, which [`extract_answer`] discards by design.
+///
+/// Fewer than two anchors returns `None` rather than a number, because a single
+/// anchor is almost always the answer itself — it would score correctness twice
+/// and tell no two failures apart.
+pub fn step_recall<'a>(
+    reply: &str,
+    question: &str,
+    values: impl IntoIterator<Item = Option<&'a str>>,
+) -> Option<f64> {
+    let found = solution_anchors(question, values);
+    if found.len() < 2 {
+        return None;
+    }
+    let hit = found.iter().filter(|a| contains_token(reply, a)).count();
+    Some(hit as f64 / found.len() as f64)
+}
+
 // ------------------------------------------------- answer extraction ----
 /// Lift the final answer and stated confidence out of a reasoning reply.
 ///
@@ -698,4 +801,61 @@ fn parse_confidence(text: &str) -> Option<f64> {
     // A percentage if it came in as 0-100.
     let n = if n > 1.0 { n / 100.0 } else { n };
     Some(n.clamp(0.0, 1.0))
+}
+
+#[cfg(test)]
+mod partial_credit_tests {
+    use super::*;
+
+    #[test]
+    fn token_match_respects_digit_boundaries() {
+        assert!(contains_token("so x = 28 here", "28"));
+        assert!(contains_token("28", "28"));
+        assert!(contains_token("(28)", "28"));
+        assert!(!contains_token("128", "28"), "must not match a suffix");
+        assert!(!contains_token("283", "28"), "must not match a prefix");
+        assert!(!contains_token("28.5", "28"), "must not match a decimal head");
+        assert!(!contains_token("-28", "28"), "a negative is a different value");
+        assert!(contains_token("337-2", "337"), "subtraction is still an occurrence");
+    }
+
+    #[test]
+    fn anchors_drop_what_a_solver_never_had_to_derive() {
+        let got = solution_anchors(
+            "remainder 17 when divided by 20",
+            [
+                Some("17 mod 20"), // a restatement, not an integer
+                Some("20"),        // already in the question
+                Some("1"),         // single digit, occurs by chance
+                Some("337"),
+                Some("337"), // duplicate
+                None,        // structural step
+            ],
+        );
+        assert_eq!(got, vec!["337".to_string()]);
+    }
+
+    #[test]
+    fn one_anchor_scores_nothing_because_it_is_the_answer() {
+        // Scoring a single anchor would just be correctness counted twice, and
+        // would tell no two failed attempts apart.
+        assert_eq!(step_recall("x = 337", "q", [Some("337")]), None);
+    }
+
+    #[test]
+    fn recall_is_the_fraction_of_the_path_reached() {
+        let path = [Some("28"), Some("56"), Some("13"), Some("99")];
+        assert_eq!(step_recall("first 28, then 56, lost it", "q", path), Some(0.5));
+        assert_eq!(step_recall("28 56 13 99", "q", path), Some(1.0));
+        assert_eq!(step_recall("no idea", "q", path), Some(0.0));
+    }
+
+    #[test]
+    fn near_misses_do_not_score() {
+        // The failure mode this guards: a model that learns to emit plausible
+        // numbers rather than to reason. Every anchor off by one must score ~0.
+        let path = [Some("28"), Some("56"), Some("13"), Some("99")];
+        let spam = "29 57 14 100";
+        assert_eq!(step_recall(spam, "q", path), Some(0.0));
+    }
 }
