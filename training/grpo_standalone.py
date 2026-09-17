@@ -517,9 +517,28 @@ def main() -> None:
         tok.pad_token = tok.eos_token
     tok.padding_side = "left"  # so generated tokens are a contiguous suffix
 
-    model = AutoModelForCausalLM.from_pretrained(
-        args.base_model, torch_dtype=torch.bfloat16, device_map=device
-    )
+    # .to(device), NOT device_map=device. `device_map` routes the load through
+    # accelerate, which attaches a hook to every submodule to check and move
+    # tensors; on a model that fits on one GPU those hooks buy nothing and run
+    # hundreds of times per forward. Generation is essentially the whole wall
+    # clock here - a measured A100 run managed 68 tok/s across 8 streams, 104 ms
+    # per decode step, when the weight read alone should cost about 5 ms - so
+    # per-forward overhead is the first thing to remove.
+    #
+    # attn_implementation is named rather than left to the default, because the
+    # default is a function of the installed torch and transformers and this run
+    # should not silently change speed when Colab updates a wheel.
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.base_model, dtype=torch.bfloat16, attn_implementation="sdpa"
+        ).to(device)
+    except (ValueError, ImportError) as e:
+        print(f"note: sdpa attention unavailable ({e}); falling back to the default",
+              file=sys.stderr)
+        model = AutoModelForCausalLM.from_pretrained(
+            args.base_model, dtype=torch.bfloat16
+        ).to(device)
+    print(f"attention: {getattr(model.config, '_attn_implementation', 'unknown')}")
 
     # Resume before creating a fresh adapter, or a preempted run starts over from
     # random weights while looking like it continued.
