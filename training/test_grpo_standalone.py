@@ -15,6 +15,7 @@ from grpo_standalone import (  # noqa: E402
     completion_mask,
     group_advantages,
     policy_gradient_loss,
+    problem_weight,
     reward_health,
     sequence_logprob,
     shaped_rewards,
@@ -217,5 +218,59 @@ msg = reward_health([DONE] * 80, [ranked] * 10, 8192, 0.05, [0] * 9 + [3])
 assert not msg.startswith("***"), f"one group with a correct answer is enough: {msg}"
 assert "correct/incorrect split" in msg, msg
 print("all-wrong-forever aborts; one correct answer is enough to proceed")
+
+# ------------------------------------------------------ learning progress ---
+
+G = 8
+w = lambda h, age=0: problem_weight(h, G, age)
+
+# EXPLOITATION over exploration, which is the correction that made this work at
+# all. An untried problem must outrank one that just came back unanimous - but a
+# problem PROVEN to sit in the band must outrank an untried one, or the sampler
+# explores forever and never exploits. Simulated, the obvious way round
+# (untried > proven) scored 36.2% against uniform's 36.9%: it was worth nothing.
+assert w([]) > w([0]) and w([]) > w([8]), f"{w([])} vs {w([0])}, {w([8])}"
+assert w([3]) > w([]), f"a proven band problem must beat an unknown: {w([3])} vs {w([])}"
+print(f"proven band {w([3]):.2f} > untried {w([]):.2f} > exhausted {w([0]):.2f}")
+
+# A group that disagreed carries a gradient now; a unanimous one does not. Both
+# ends of unanimous are equally useless - all-right teaches as little as all-wrong.
+assert w([3]) > w([0]) and w([3]) > w([8]), f"mixed must beat unanimous: {w([3])}"
+assert w([0]) == w([8]), "solved and hopeless are equally uninformative"
+print(f"mixed {w([3]):.2f} > unanimous {w([0]):.2f}")
+
+# THE point of the thing: movement beats level. Two problems both sitting at 3/8
+# right now, but one arrived there from 0 and the other has not moved - the one
+# that moved is where the policy is actually changing.
+assert w([0, 3]) > w([3, 3]), f"{w([0, 3])} vs {w([3, 3])}"
+print(f"moved 0->3 {w([0, 3]):.2f} > plateau 3->3 {w([3, 3]):.2f}")
+
+# Movement below the binomial noise floor does not count. At 8 rollouts one
+# extra correct answer has standard deviation 1.4, so chasing a swing of 1 is
+# chasing the sampler, not the policy.
+assert w([3, 4]) == w([3, 3]), f"a swing of 1 is noise: {w([3, 4])} vs {w([3, 3])}"
+assert w([0, 4]) > w([0, 2]), "a real move outweighs a small one"
+print(f"delta 1 ignored as noise; delta 4 {w([0, 4]):.2f} > delta 2 {w([0, 2]):.2f}")
+
+# Staleness. "Unanimous once" is a fact about the policy that drew it, not about
+# the problem forever - so weight recovers, and nothing is permanently dead.
+assert w([0], age=0) < w([0], age=50) < w([0], age=200), "must recover with age"
+assert w([0], age=4000) > 0.28, f"a long-stale problem is worth retrying: {w([0], 4000)}"
+assert w([0], age=4000) < w([3]), "but never above a problem proven to be in the band"
+assert w([0], age=0) > 0, "no problem is ever permanently excluded"
+print(f"stale 0/8: age 0 {w([0], 0):.2f} -> age 400 {w([0], 400):.2f} "
+      f"-> age 4000 {w([0], 4000):.2f}")
+
+# A problem that is unanimous EVERY time, freshly drawn, sinks to the floor -
+# which is what stops the run spending 11 minutes a group re-proving that d3 is
+# easy, and is exactly what the first run did 39 times out of 40.
+assert w([8, 8, 8]) < 0.1, f"repeatedly solved must sink: {w([8, 8, 8])}"
+assert w([8, 8, 8]) < w([]) < w([3]), "ordering: exhausted < untried < proven band"
+print(f"solved three times running -> {w([8, 8, 8]):.2f}, against {w([3]):.2f} for mixed")
+
+# Degenerate inputs must not blow up the sampler mid-run.
+assert problem_weight([], 0, 0) > 0 and problem_weight([0], 0, 0) > 0
+assert problem_weight([4], 8, -1) > 0, "a negative age must not produce a negative weight"
+print("degenerate generations and ages stay positive")
 
 print("\nall GRPO maths verified - no GPU, no model, no framework")

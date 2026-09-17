@@ -99,6 +99,84 @@ def group_advantages(
     return [(r - mean) / std for r in rewards]
 
 
+def problem_weight(
+    history: list[int],
+    generations: int,
+    age: int,
+    *,
+    exploit: float = 5.0,
+    unseen: float = 0.3,
+    floor: float = 0.02,
+    half_life: float = 400.0,
+) -> float:
+    """How much a rollout spent on this problem is likely to teach.
+
+    Uniform sampling spends most of the budget on problems that are already
+    solved or entirely hopeless, because on this curriculum most of them are:
+    the first d3 run got one gradient step in forty. Retiring a problem the
+    moment it comes back unanimous is the crude fix, and it throws away two
+    things - that a problem can BECOME trainable as the policy moves, and that a
+    problem which disagrees every single time may be a plateau rather than a
+    frontier.
+
+    This follows Schmidhuber's curiosity formulation instead: the thing worth
+    rewarding is learning PROGRESS, the first derivative of success, not the
+    success rate itself. Three parts, and the weight is whichever is largest:
+
+      spread     the last group disagreed, so a rollout here carries a gradient
+                 right now
+      progress   the success rate MOVED between the last two visits, so this is
+                 where the policy is actually changing
+      staleness  weight recovers as a problem goes unvisited, because "unanimous
+                 once" is evidence about the policy that drew it, not a permanent
+                 fact about the problem
+
+    `history` is pass counts out of `generations`, oldest first. `age` is
+    attempts since it was last drawn. Nothing ever reaches zero, so no problem is
+    permanently dead.
+
+    Movement is only counted above the binomial noise floor. At 8 rollouts a
+    one-sample swing has standard deviation sqrt(8)/2 = 1.4, so a change of one
+    correct answer is indistinguishable from resampling the same policy - and
+    chasing it would be chasing the sampler.
+
+    THE DEFAULTS ARE MEASURED, not chosen. Simulated over 520 draws on a
+    450-problem population shaped like the observed run (52% solved, 26% out of
+    reach, 22% in the band), against uniform sampling at 36.9%:
+
+        exploit  unseen   gradient   distinct problems   top 5 got
+            0.6     1.0      36.2%        138                 9%
+            5.0     0.3      64.1%         80                20%
+           20.0     0.3      75.2%         53                31%
+           20.0     0.1      81.7%         39                46%
+
+    The first row was the obvious parameterisation and it is worth NOTHING - an
+    unexplored problem outranking a proven one means the sampler explores forever
+    and never exploits, which on 450 problems is uniform sampling with extra
+    steps. The last row doubles the yield again but puts nearly half the updates
+    on five problems, and this run is measured on held-out problems, so that
+    trade is not free. 5.0 nearly doubles the gradient per GPU-hour while keeping
+    the spread of problems within sight of uniform.
+
+    What the simulation could NOT test is the progress term: its latent
+    difficulties are fixed, so nothing ever genuinely moves and only sampling
+    noise does. Progress is kept because it is the part that distinguishes a
+    problem the policy is actually learning from one stuck at a coin flip
+    forever, and it costs nothing - but it is unvalidated, unlike `exploit`.
+    """
+    if not history:
+        return unseen          # never tried: the only way to find the band at all
+    g = max(generations, 1)
+    last = history[-1]
+    in_band = 1.0 if 0 < last < g else 0.0
+    progress = 0.0
+    if len(history) >= 2:
+        moved = abs(history[-1] - history[-2]) - (g ** 0.5) / 2
+        progress = max(0.0, moved) / g
+    recovered = unseen * (1.0 - 0.5 ** (max(age, 0) / max(half_life, 1e-9)))
+    return max(floor, exploit * (in_band + progress), recovered)
+
+
 def completion_mask(prompt_len: int, total_len: int, pad_from: int | None = None) -> list[int]:
     """1 for tokens the policy generated, 0 for prompt and padding.
 
@@ -397,6 +475,22 @@ def parse_args() -> argparse.Namespace:
     # to drift - but it is high enough for forty steps to leave a mark.
     p.add_argument("--lr", type=float, default=2e-5)
     p.add_argument(
+        "--exploit", type=float, default=5.0,
+        help="how hard to favour problems already shown to sit in the trainable "
+             "band. Simulated on a 450-problem population shaped like the "
+             "measured run: 0.6 is worth nothing (36%% against uniform's 37%%), "
+             "5.0 gives 64%% over 80 distinct problems, 20.0 gives 75%% over 53. "
+             "Higher buys gradient per GPU-hour and pays in concentration, and "
+             "this run is scored on held-out problems.",
+    )
+    p.add_argument(
+        "--pool", type=int, default=0, metavar="N",
+        help="train on a stratified N-problem subset (0 = all of it). No longer "
+             "needed - at --exploit 5 the sampler works on the full 450 - but it "
+             "raises the revisit rate if you want learning progress measured "
+             "within a single session rather than across four.",
+    )
+    p.add_argument(
         "--min-spread", type=float, default=0.05,
         help="a group whose rewards differ by less than this is treated as "
              "unanimous. Stops normalisation from amplifying a one-anchor "
@@ -457,6 +551,27 @@ def main() -> None:
     args = parse_args()
     rows = load_rows(args.dataset)
     print(f"dataset: {len(rows)} problems from {args.dataset}")
+    if args.pool and args.pool < len(rows):
+        # Deterministic in --seed, and taken BEFORE anything else touches the
+        # rows, so a resumed session draws the same pool and its stored history
+        # still refers to problems that are in it. Stratified by family, because
+        # a random 60 of 450 can easily miss a family entirely and then the run
+        # silently trains on nine tenths of the curriculum.
+        import random
+        by_fam: dict[str, list[dict]] = {}
+        for r in rows:
+            by_fam.setdefault(r["id"].split("-")[1], []).append(r)
+        rng = random.Random(args.seed)
+        for v in by_fam.values():
+            rng.shuffle(v)
+        picked, fams = [], sorted(by_fam)
+        while len(picked) < args.pool and any(by_fam[f] for f in fams):
+            for f in fams:
+                if by_fam[f] and len(picked) < args.pool:
+                    picked.append(by_fam[f].pop())
+        rows = sorted(picked, key=lambda r: r["id"])
+        print(f"  --pool {args.pool}: training on {len(rows)} of them, "
+              f"{len(fams)} families, so learning progress has revisits to measure")
 
     # Prove the reward path BEFORE any GPU time. A reward function that silently
     # returns 0 trains the model to do nothing, slowly and expensively.
@@ -602,18 +717,52 @@ def main() -> None:
     # also retired: on this curriculum a prompt is usually solved-or-doomed
     # rather than uncertain, so re-drawing it buys the same nothing again.
     step = 0
-    retired: set[int] = set()
     probed: list[tuple[str, int, list[float]]] = []
+
+    # Per-problem visit history, keyed by problem id rather than row index so a
+    # regenerated dataset does not silently attach one problem's history to
+    # another. It lives beside the adapter and the optimiser state, because the
+    # whole point of measuring learning progress is that it accumulates - and
+    # this run only fits in a Colab session three or four times over. Within one
+    # 40-group session almost nothing is revisited; across four, it is.
+    hist_path = args.output / "curriculum.json"
+    seen: dict[str, list[int]] = {}
+    last_drawn: dict[str, int] = {}
+    if args.resume and hist_path.exists():
+        try:
+            saved = json.loads(hist_path.read_text(encoding="utf-8"))
+            seen = {k: list(v) for k, v in saved.get("history", {}).items()}
+            known = {r["id"] for r in rows}
+            stale = [k for k in seen if k not in known]
+            for k in stale:
+                del seen[k]
+            print(f"curriculum: {len(seen)} problems with history"
+                  + (f" ({len(stale)} dropped - not in this dataset)" if stale else ""))
+        except (json.JSONDecodeError, OSError, TypeError) as e:
+            print(f"warning: could not read {hist_path} ({e}); starting fresh",
+                  file=sys.stderr)
+
+    def save_history() -> None:
+        args.output.mkdir(parents=True, exist_ok=True)
+        hist_path.write_text(
+            json.dumps({"generations": args.generations, "history": seen}, indent=1),
+            encoding="utf-8",
+        )
     max_attempts = args.probe if args.probe else args.steps * args.attempts_per_step
     while trained < args.steps and attempts < max_attempts:
-        live = [i for i in range(len(rows)) if i not in retired]
-        if not live:
-            print("every problem has come back unanimous at least once; "
-                  "reopening the pool", flush=True)
-            retired.clear()
-            live = list(range(len(rows)))
-        idx = live[int(torch.randint(len(live), (1,), generator=g).item())]
+        # Sample by learning progress rather than uniformly. No pool to exhaust
+        # and no reopening: every weight stays positive, and a problem that came
+        # back unanimous recovers on its own as the policy moves away from the
+        # one that drew it.
+        weights = [
+            problem_weight(seen.get(r["id"], []), args.generations,
+                           attempts - last_drawn.get(r["id"], 0),
+                           exploit=args.exploit)
+            for r in rows
+        ]
+        idx = int(torch.multinomial(torch.tensor(weights), 1, generator=g).item())
         row = rows[idx]
+        past = seen.get(row["id"], [])
         chat = [
             {"role": "system", "content": REASONING_SYSTEM},
             {"role": "user", "content": row["question"]},
@@ -629,8 +778,9 @@ def main() -> None:
         # change the setting underneath us.
         model.eval()
         model.config.use_cache = True
+        why = "new" if not past else f"seen {len(past)}x {past[-3:]}"
         print(f"step {step:>4}  generating {gens} x <={args.max_new} tok "
-              f"({row['domain']}) ...", end="", flush=True)
+              f"({row['domain']}, {why}) ...", end="", flush=True)
         t_gen = time.time()
         # OOM is a survivable condition, not the end of the run. The KV cache
         # scales with the group size, so halving it is the one knob that reliably
@@ -671,6 +821,8 @@ def main() -> None:
         rewards = shaped_rewards(verdicts, args.shaping)
         advantages = group_advantages(rewards, min_spread=args.min_spread)
         n_right = sum(1 for ok, _ in verdicts if ok)
+        seen.setdefault(row["id"], []).append(n_right)
+        last_drawn[row["id"]] = attempts
 
         if len(seen_groups) < 10:
             seen_texts += texts
@@ -719,7 +871,6 @@ def main() -> None:
         # A flat group carries no information; skip the backward pass entirely
         # rather than spending it on a zero gradient.
         if all(a == 0.0 for a in advantages):
-            retired.add(idx)
             print(f" {n_right}/{len(verdicts)} right, reward "
                   f"{sum(rewards)/len(rewards):.2f} (unanimous - no gradient; "
                   f"{trained}/{args.steps} trained, "
@@ -788,6 +939,7 @@ def main() -> None:
             args.output.mkdir(parents=True, exist_ok=True)
             model.save_pretrained(str(args.output))
             torch.save(opt.state_dict(), opt_state)
+            save_history()
             print(f"  checkpoint -> {args.output}", flush=True)
 
     if args.probe:
@@ -821,9 +973,27 @@ def main() -> None:
     args.output.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(str(args.output))
     torch.save(opt.state_dict(), opt_state)
+    save_history()
     tok.save_pretrained(str(args.output))
     print(f"\nsaved GRPO adapter to {args.output} "
           f"({trained} gradient steps this session, {attempts} prompts tried)")
+
+    # What the curriculum knows now. Across one session this is mostly a list of
+    # first impressions; it earns its keep over the three or four sessions this
+    # run takes, which is why it is stored beside the adapter.
+    if seen:
+        visits = [len(v) for v in seen.values()]
+        revisited = sum(1 for v in visits if v > 1)
+        band = sum(1 for v in seen.values() if 0 < v[-1] < args.generations)
+        dead = sum(1 for v in seen.values() if len(v) > 1 and all(
+            x == 0 or x == args.generations for x in v))
+        print(f"curriculum: {len(seen)}/{len(rows)} problems tried, "
+              f"{revisited} more than once, {sum(visits)} visits total")
+        print(f"  {band} last came back mixed - these are the trainable band")
+        print(f"  {dead} were unanimous every visit - solved or out of reach")
+        if revisited < 5:
+            print("  (too few revisits to measure learning progress yet; it needs "
+                  "several sessions, or a smaller --pool)")
 
 
 if __name__ == "__main__":
