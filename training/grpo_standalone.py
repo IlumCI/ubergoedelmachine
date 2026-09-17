@@ -460,12 +460,32 @@ def parse_args() -> argparse.Namespace:
     # fit" rather than "was it right".
     p.add_argument("--max-new", type=int, default=8192)
     p.add_argument("--max-prompt", type=int, default=2048)
-    p.add_argument("--generations", type=int, default=8,
-                   help="completions per prompt; a group needs SPREAD to teach anything")
-    # Rollouts dominate, and without vLLM they are plain HF generate: 8 completions
-    # of up to 8k tokens is ~65k tokens per step, so expect MINUTES per step rather
-    # than seconds. 40 steps is a first run that shows whether reward moves; it is
-    # not a finished model. Raise it once the loop is proven.
+    p.add_argument(
+        "--generations", type=int, default=32,
+        help="completions per prompt; a group needs SPREAD to teach anything. 32, "
+             "not 8, because rollouts turned out to be nearly free - see below.",
+    )
+    # ROLLOUTS ARE NEARLY FREE, which was the opposite of what this file assumed.
+    # Measured on an A100-80GB, Qwen3-4B + LoRA r=16, 256 new tokens:
+    #
+    #     group    tok/s   ms per decode step
+    #         8       75                106.1
+    #        16      149                107.4
+    #        32      289                110.7
+    #        64      558                114.7
+    #
+    # The per-step cost barely moves while the batch grows eightfold, so
+    # generation here is bound by fixed per-step overhead and not by the GPU -
+    # at a group of 8 the card is close to idle. The binding cost of a step is
+    # therefore how long the LONGEST rollout runs, not how many there are, which
+    # is why --max-new matters and --generations very nearly does not.
+    #
+    # A bigger group also makes a wasted step much rarer. A problem the model
+    # solves nine times in ten comes back unanimous 43% of the time at 8
+    # rollouts and 3% at 32, and the advantage estimate is far steadier.
+    #
+    # 40 steps is a first run that shows whether reward moves; it is not a
+    # finished model. Raise it once the loop is proven.
     p.add_argument("--steps", type=int, default=40)
     # 5e-6 is a FULL-MODEL GRPO rate. On a rank-16 LoRA whose B matrix starts at
     # zero, forty steps at 5e-6 move the adapter by roughly nothing: the run
@@ -740,6 +760,21 @@ def main() -> None:
             stale = [k for k in seen if k not in known]
             for k in stale:
                 del seen[k]
+
+            # Pass counts are out of the group size they were RECORDED at, and a
+            # run that changes --generations makes every stored number mean
+            # something else. 8 recorded at a group of 8 is unanimous; read back
+            # at a group of 32 it looks like a perfectly mixed 8-of-32, and the
+            # sampler would then weight a solved problem as if it were prime
+            # territory. Rescaling keeps the ratio, which is the part that
+            # carried the meaning.
+            was = int(saved.get("generations", args.generations) or args.generations)
+            if was != args.generations and was > 0:
+                k = args.generations / was
+                seen = {i: [min(args.generations, round(c * k)) for c in v]
+                        for i, v in seen.items()}
+                print(f"curriculum: rescaled {len(seen)} histories from groups of "
+                      f"{was} to {args.generations}")
             print(f"curriculum: {len(seen)} problems with history"
                   + (f" ({len(stale)} dropped - not in this dataset)" if stale else ""))
         except (json.JSONDecodeError, OSError, TypeError) as e:
