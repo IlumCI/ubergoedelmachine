@@ -295,8 +295,11 @@ def reward_health(
         split = sum(1 for g, r in zip(groups, right) if 0 < r < len(g))
         allwrong = sum(1 for r in right if r == 0)
         note = (
-            f" Of these, {split} had a correct/incorrect split and {allwrong} were "
-            f"entirely wrong (ranked only by partial credit)."
+            # Counted over ALL the groups, not over the mixed ones - an all-wrong
+            # group can be flat as well as ranked, so these do not sum to `mixed`
+            # and saying "of these" made them look like they should.
+            f" Across all {len(groups)}: {split} had a correct/incorrect split, "
+            f"{allwrong} got nothing right."
         )
         if allwrong == len(groups):
             return (
@@ -498,6 +501,16 @@ def main() -> None:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cpu":
         sys.exit("no GPU visible - refusing to start; this needs one")
+
+    # Which GPU, said out loud. Generation dominates the wall clock here - a
+    # measured run spent 11 minutes per prompt - and the first question about a
+    # slow run is whether it landed on the accelerator it asked for. A T4 has no
+    # native bfloat16 at all, so it would emulate every matmul in this script;
+    # that is a 5-10x difference and no amount of tuning elsewhere recovers it.
+    props = torch.cuda.get_device_properties(0)
+    bf16 = torch.cuda.is_bf16_supported()
+    print(f"GPU: {props.name}, {props.total_memory / 1e9:.0f} GB, "
+          f"bfloat16 {'native' if bf16 else 'EMULATED - expect it to crawl'}")
 
     tok = AutoTokenizer.from_pretrained(args.base_model)
     if tok.pad_token_id is None:
@@ -721,7 +734,7 @@ def main() -> None:
             seq_lp = tok_lp[keep].sum() / n   # length-normalised, see the loss note
             loss = -advantages[i] * seq_lp / len(advantages)
             loss.backward()
-            total += float(loss)
+            total += float(loss.detach())   # detached: this is for the log only
 
         gnorm = torch.nn.utils.clip_grad_norm_(
             [p for p in model.parameters() if p.requires_grad], 1.0
