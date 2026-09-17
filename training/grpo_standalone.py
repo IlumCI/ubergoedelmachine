@@ -647,9 +647,13 @@ def main() -> None:
         model = AutoModelForCausalLM.from_pretrained(
             args.base_model, dtype=torch.bfloat16, attn_implementation="sdpa"
         ).to(device)
-    except (ValueError, ImportError) as e:
-        print(f"note: sdpa attention unavailable ({e}); falling back to the default",
-              file=sys.stderr)
+    except Exception as e:   # noqa: BLE001 - any refusal of the argument, not just ours
+        # Broad on purpose. This runtime is on transformers 5.x and the exact
+        # exception an unsupported attn_implementation raises is a moving target;
+        # the fallback costs one extra load and the alternative is the run dying
+        # at model load after the grader and the dataset already checked out.
+        print(f"note: sdpa attention unavailable ({type(e).__name__}: {e}); "
+              "falling back to the default", file=sys.stderr)
         model = AutoModelForCausalLM.from_pretrained(
             args.base_model, dtype=torch.bfloat16
         ).to(device)
