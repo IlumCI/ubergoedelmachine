@@ -301,9 +301,16 @@ fn multiplicative_order(base: u64, m: u64) -> u64 {
 }
 
 fn make_modpow(rng: &mut SplitMix64, d: u64, steps: &mut Vec<Step>) -> (String, String) {
-    loop {
+    // Bounded, because the rejection rules below are strict enough that an
+    // unbounded loop would be a hang rather than an error if they ever became
+    // unsatisfiable at some difficulty.
+    for _attempt in 0..2000 {
         let a = rng.range(2, 10 + 40 * d);
-        let m = rng.range(3, 10 + 30 * d);
+        // A remainder mod 4 or mod 5 is a one-in-five guess, and every quantity
+        // on the way to it is a single digit - so the problem is both cheap to
+        // fluke and impossible to award partial credit on. Half the modpow
+        // problems that scored nothing had a modulus under 12.
+        let m = rng.range(if d <= 1 { 5 } else { 12 }, 10 + 30 * d);
         if a % m == 0 {
             continue; // degenerate: remainder trivially 0 for any exponent
         }
@@ -312,6 +319,34 @@ fn make_modpow(rng: &mut SplitMix64, d: u64, steps: &mut Vec<Step>) -> (String, 
             3 => rng.range(50, 5000),
             _ => rng.range(1_000_000, 1_000_000_000),
         };
+        let base = a % m;
+        let g = gcd(base, m);
+        // Degenerate exponentiation, rejected BEFORE anything is recorded - a
+        // `continue` after a push would leave the failed draw's steps in the
+        // trace. An order of 2 turns the answer into a parity check on the
+        // exponent, and a squaring ladder that reaches a fixed point immediately
+        // makes it constant for every large exponent. Neither needs the method
+        // the family exists to teach, and both leave one derived quantity in the
+        // whole trace.
+        if g == 1 {
+            if multiplicative_order(base, m) < 4 {
+                continue;
+            }
+        } else {
+            let mut distinct: Vec<u64> = Vec::new();
+            let (mut acc, mut e) = (base, 1u64);
+            while e * 2 <= b && distinct.len() < 3 {
+                acc = acc * acc % m;
+                e *= 2;
+                if !distinct.contains(&acc) {
+                    distinct.push(acc);
+                }
+            }
+            if distinct.len() < 3 {
+                continue;
+            }
+        }
+
         let q = format!("What is the remainder when {a}^{b} is divided by {m}?");
         let gold = modpow(a, b, m);
 
@@ -319,9 +354,7 @@ fn make_modpow(rng: &mut SplitMix64, d: u64, steps: &mut Vec<Step>) -> (String, 
         // code takes: reduce the base, find the multiplicative order, reduce the
         // exponent against it, then a small power. Square-and-multiply would be
         // a faithful record of `modpow` and a useless lesson.
-        let base = a % m;
         steps.push(Step::new(format!("Reduce the base: {a} mod {m} = {base}"), base.to_string()));
-        let g = gcd(base, m);
         if g == 1 {
             let ord = multiplicative_order(base, m);
             steps.push(Step::new(
@@ -334,6 +367,16 @@ fn make_modpow(rng: &mut SplitMix64, d: u64, steps: &mut Vec<Step>) -> (String, 
                 r.to_string(),
             ));
             let eff = if r == 0 { ord } else { r };
+            // The cycle itself, which is how the order is found and what the
+            // order argument actually means. The trace recorded the order and the
+            // reduced exponent - both small enough to be unscoreable - and then
+            // jumped to the answer, leaving one derived quantity in the whole
+            // problem. Walking the powers to 1 is the work.
+            let mut acc = 1u64;
+            for e in 1..=ord.min(12) {
+                acc = acc * base % m;
+                steps.push(Step::new(format!("{base}^{e} = {acc} (mod {m})"), acc.to_string()));
+            }
             steps.push(Step::new(
                 format!("So {a}^{b} = {base}^{eff} (mod {m})"),
                 modpow(base, eff, m).to_string(),
@@ -343,10 +386,21 @@ fn make_modpow(rng: &mut SplitMix64, d: u64, steps: &mut Vec<Step>) -> (String, 
                 "gcd({base}, {m}) = {g} > 1, so the powers need not cycle back to 1 \
                  and the order argument does not apply; square and multiply instead"
             )));
+            // This branch recorded a note and the answer - one valued step in the
+            // entire problem, so every failed rollout tied. Repeated squaring IS
+            // the route here, and each square is independently checkable.
+            let mut acc = base;
+            let mut e = 1u64;
+            while e * 2 <= b && e <= 1 << 12 {
+                acc = acc * acc % m;
+                e *= 2;
+                steps.push(Step::new(format!("{base}^{e} = {acc} (mod {m})"), acc.to_string()));
+            }
         }
         steps.push(Step::new(format!("{a}^{b} mod {m} = {gold}"), gold.to_string()));
         return (q, gold.to_string());
     }
+    panic!("modpow: no non-degenerate draw in 2000 attempts at difficulty {d}");
 }
 
 fn make_crt(rng: &mut SplitMix64, d: u64, steps: &mut Vec<Step>) -> (String, String) {
@@ -933,12 +987,26 @@ fn make_automata(rng: &mut SplitMix64, d: u64, steps: &mut Vec<Step>) -> (String
     panic!("automata: no non-degenerate DFA in 500 draws at difficulty {d}");
 }
 
-/// Dijkstra over a small graph. None when the target is unreachable, which the
-/// caller regenerates rather than asks about.
-fn shortest_path(n: usize, edges: &[(usize, usize, u64)], from: usize, to: usize) -> Option<u64> {
+/// Dijkstra that also reports the fewest edges on any shortest path.
+///
+/// The hop count is what says whether the problem needs a search at all: a
+/// one-hop answer is an edge weight copied out of the question, and a two-hop
+/// answer is found by looking rather than by running the algorithm.
+///
+/// Weights are all at least 1, so a settled distance is final and no later
+/// relaxation can tie it - which is why the hop count may be updated only for
+/// unsettled vertices.
+fn shortest_path_hops(
+    n: usize,
+    edges: &[(usize, usize, u64)],
+    from: usize,
+    to: usize,
+) -> Option<(u64, usize)> {
     let mut dist = vec![u64::MAX; n];
-    dist[from] = 0;
+    let mut hops = vec![usize::MAX; n];
     let mut done = vec![false; n];
+    dist[from] = 0;
+    hops[from] = 0;
     for _ in 0..n {
         let mut best = usize::MAX;
         for v in 0..n {
@@ -951,15 +1019,23 @@ fn shortest_path(n: usize, edges: &[(usize, usize, u64)], from: usize, to: usize
         }
         done[best] = true;
         for &(u, v, w) in edges {
-            for (a, b) in [(u, v), (v, u)] {
-                if a == best && dist[best] + w < dist[b] {
-                    dist[b] = dist[best] + w;
+            for (x, y) in [(u, v), (v, u)] {
+                if x != best || done[y] {
+                    continue;
+                }
+                let cand = dist[best] + w;
+                // A tie goes to the path with fewer edges, so this is the hop
+                // minimum over all shortest paths, not whichever was seen first.
+                if cand < dist[y] || (cand == dist[y] && hops[best] + 1 < hops[y]) {
+                    dist[y] = cand;
+                    hops[y] = hops[best] + 1;
                 }
             }
         }
     }
-    (dist[to] != u64::MAX).then_some(dist[to])
+    (dist[to] != u64::MAX).then(|| (dist[to], hops[to]))
 }
+
 
 /// Kruskal with union-find: total weight of a minimum spanning tree, or None if
 /// the graph is disconnected.
@@ -997,13 +1073,17 @@ fn find_root(parent: &mut Vec<usize>, mut x: usize) -> usize {
 
 fn make_graph(rng: &mut SplitMix64, d: u64, steps: &mut Vec<Step>) -> (String, String) {
     let n = (4 + d).min(8) as usize;
-    let max_w = 5 + 5 * d;
+    // Weights from 10 up, not from 1. With single-digit weights every settled
+    // distance is a single digit too, so the whole Dijkstra trace is unscoreable
+    // and the answer space is small enough to fluke. The algorithm is identical;
+    // only the arithmetic is wider.
+    let max_w = 20 + 20 * d;
     for _attempt in 0..500 {
         let mut edges: Vec<(usize, usize, u64)> = Vec::new();
         for u in 0..n {
             for v in (u + 1)..n {
                 if rng.chance(55) {
-                    edges.push((u, v, rng.range(1, max_w)));
+                    edges.push((u, v, rng.range(10, max_w)));
                 }
             }
         }
@@ -1014,9 +1094,21 @@ fn make_graph(rng: &mut SplitMix64, d: u64, steps: &mut Vec<Step>) -> (String, S
         let gold = if ask_mst {
             mst_weight(n, &edges)
         } else {
-            shortest_path(n, &edges, 0, n - 1)
+            // At least three hops. A direct v0-v{n-1} edge makes the answer a
+            // weight read straight off the question, and a two-hop answer is
+            // found by looking rather than by running Dijkstra. Both turned up
+            // in a 108-problem sample.
+            match shortest_path_hops(n, &edges, 0, n - 1) {
+                Some((w, hops)) if hops >= 3 => Some(w),
+                _ => None,
+            }
         };
         let Some(gold) = gold else { continue };
+        // And the answer must not coincide with a weight already on the page,
+        // whichever question was asked.
+        if edges.iter().any(|&(_, _, w)| w == gold) {
+            continue;
+        }
         let mut q = format!(
             "An undirected weighted graph has {n} vertices labelled v0 to v{}. Its edges are:",
             n - 1
@@ -1876,7 +1968,10 @@ mod cs_tests {
             let mut seen = vec![false; n];
             seen[0] = true;
             let brute = best(n, &edges, 0, n - 1, &mut seen, 0);
-            assert_eq!(shortest_path(n, &edges, 0, n - 1), brute);
+            // Checks the function make_graph actually calls, so the hop-aware
+            // version is the one held to brute force.
+            let got = shortest_path_hops(n, &edges, 0, n - 1).map(|(w, _)| w);
+            assert_eq!(got, brute);
         }
     }
 
@@ -2374,6 +2469,12 @@ mod anchor_coverage_tests {
     /// Scored with the SAME function the grader uses on real rollouts, via the
     /// dev-dependency - so tightening the anchor rules moves the generators and
     /// the reward together instead of silently stranding one.
+    ///
+    /// d3-d5 only, which is the range GRPO trains on. d1 and d2 are deliberately
+    /// small and score lower - `knights` at 0%, `automata` at 42% - because their
+    /// quantities genuinely fit in one digit at that size. Those problems are
+    /// solved-or-doomed for the model anyway, so partial credit there would rank
+    /// failures that do not happen.
     #[test]
     fn every_family_records_scoreable_intermediates() {
         let mut per_family: BTreeMap<String, (usize, usize)> = BTreeMap::new();
@@ -2391,10 +2492,11 @@ mod anchor_coverage_tests {
 
         // A floor, not the measured rate: the rates move with any change to the
         // generators, and pinning them would turn an improvement into a failure.
-        // What must never come back is a family at or near zero.
+        // What must never come back is a family at or near zero. Measured 94-100%
+        // across the board when this was written.
         for (fam, (ok, n)) in &per_family {
             assert!(
-                *ok * 100 >= *n * 30,
+                *ok * 100 >= *n * 60,
                 "{fam}: only {ok}/{n} problems have two or more scoreable \
                  intermediates. Its steps are probably recording compound \
                  strings or single digits rather than derived quantities."
@@ -2402,7 +2504,7 @@ mod anchor_coverage_tests {
         }
         let ok: usize = per_family.values().map(|v| v.0).sum();
         let n: usize = per_family.values().map(|v| v.1).sum();
-        assert!(ok * 100 >= n * 70, "overall coverage {ok}/{n} fell below 70%");
+        assert!(ok * 100 >= n * 90, "overall coverage {ok}/{n} fell below 90%");
     }
 
     /// The recurrence family's whole lesson is that an astronomical index folds
