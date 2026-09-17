@@ -63,7 +63,9 @@ REASONING_SYSTEM = (
 # this file is plumbing around them.
 
 
-def group_advantages(rewards: list[float], eps: float = 1e-4) -> list[float]:
+def group_advantages(
+    rewards: list[float], eps: float = 1e-4, min_spread: float = 0.0
+) -> list[float]:
     """How far each completion's reward sits from its group's mean, scaled.
 
     This is the whole of "group relative". There is no critic estimating a
@@ -74,10 +76,21 @@ def group_advantages(rewards: list[float], eps: float = 1e-4) -> list[float]:
     nothing in the group is evidence that one behaviour beat another. Dividing by
     a near-zero spread would manufacture enormous advantages out of floating
     point noise, so the epsilon floor matters.
+
+    `min_spread` is the same argument in absolute units, and it exists because
+    partial credit reintroduced the problem the epsilon floor was built to stop.
+    Dividing by the standard deviation is scale-free: eight wrong rollouts where
+    one reached four intermediates and another three differ by about 0.02, and
+    normalising turns that into a full-sized +/-1.2 advantage. The model would
+    then train as hard on one accidental number as on getting the answer right.
+    A correct/incorrect split is worth 0.75 or more, so a floor here costs the
+    binary signal nothing and discards only the amplified noise.
     """
     n = len(rewards)
     if n == 0:
         return []
+    if min_spread and max(rewards) - min(rewards) < min_spread:
+        return [0.0] * n
     mean = sum(rewards) / n
     var = sum((r - mean) ** 2 for r in rewards) / n
     std = var ** 0.5
@@ -248,7 +261,13 @@ def grade(grader_cmd: str, items: list) -> list[tuple[bool, float | None]]:
     return verdicts
 
 
-def reward_health(texts: list[str], groups: list[list[float]], budget: int) -> str:
+def reward_health(
+    texts: list[str],
+    groups: list[list[float]],
+    budget: int,
+    min_spread: float = 0.0,
+    right: list[int] | None = None,
+) -> str:
     """Whether the opening groups carry any gradient, and if not, why.
 
     A run of unanimous groups is not slow progress, it is no progress - and from
@@ -259,9 +278,34 @@ def reward_health(texts: list[str], groups: list[list[float]], budget: int) -> s
     answered = sum(1 for t in texts if "answer:" in t.lower()) / max(len(texts), 1)
     # Spread on the REWARDS, not the verdicts: with step-recall shaping a group
     # of eight wrong answers carries a gradient whenever they got different
-    # distances along the path, and counting booleans would call that dead.
-    mixed = sum(1 for g in groups if g and max(g) - min(g) > 1e-9)
+    # distances along the path, and counting booleans would call that dead. Uses
+    # the same floor the trainer uses, or this would report gradient the trainer
+    # then declines to take.
+    floor = max(min_spread, 1e-9)
+    mixed = sum(1 for g in groups if g and max(g) - min(g) >= floor)
     rate = mixed / max(len(groups), 1)
+
+    # Shaping makes almost every group technically mixed, so "mixed" alone stops
+    # being the interesting number. What matters is whether the model is ever
+    # getting these right: a run where every group is all-wrong is ranking
+    # failures forever and will never learn to answer, however healthy the
+    # gradient looks.
+    note = ""
+    if right is not None and right:
+        split = sum(1 for g, r in zip(groups, right) if 0 < r < len(g))
+        allwrong = sum(1 for r in right if r == 0)
+        note = (
+            f" Of these, {split} had a correct/incorrect split and {allwrong} were "
+            f"entirely wrong (ranked only by partial credit)."
+        )
+        if allwrong == len(groups):
+            return (
+                f"*** every one of {len(groups)} opening groups was entirely wrong. "
+                f"Partial credit still gives a gradient, so this will train - but "
+                f"toward reaching intermediates, never toward finishing, because "
+                f"nothing here has ever shown it what finishing looks like. Mix in "
+                f"an easier DIFFICULTY so some groups land correct."
+            )
     # A THIRD, not one. `if mixed:` passed a run where 1 group in 10 had spread,
     # and it went on to spend five hours producing a single gradient step -
     # every other step skipped as unanimous. Spread has to be common enough that
@@ -270,7 +314,7 @@ def reward_health(texts: list[str], groups: list[list[float]], budget: int) -> s
         return (
             f"reward health: {mixed}/{len(groups)} opening groups had spread, "
             f"{answered:.0%} of rollouts finished with an answer. Training has "
-            "something to learn from."
+            "something to learn from." + note
         )
     if mixed and answered >= 0.5:
         return (
@@ -342,7 +386,20 @@ def parse_args() -> argparse.Namespace:
     # than seconds. 40 steps is a first run that shows whether reward moves; it is
     # not a finished model. Raise it once the loop is proven.
     p.add_argument("--steps", type=int, default=40)
-    p.add_argument("--lr", type=float, default=5e-6)
+    # 5e-6 is a FULL-MODEL GRPO rate. On a rank-16 LoRA whose B matrix starts at
+    # zero, forty steps at 5e-6 move the adapter by roughly nothing: the run
+    # finishes, the log looks healthy, and the weights are indistinguishable from
+    # the base. 2e-5 is still conservative - there is no KL penalty to a frozen
+    # reference here, so a rate high enough to matter is also a rate high enough
+    # to drift - but it is high enough for forty steps to leave a mark.
+    p.add_argument("--lr", type=float, default=2e-5)
+    p.add_argument(
+        "--min-spread", type=float, default=0.05,
+        help="a group whose rewards differ by less than this is treated as "
+             "unanimous. Stops normalisation from amplifying a one-anchor "
+             "difference into a full-sized advantage; a correct/incorrect split "
+             "is 0.75 or more, so the binary signal is untouched.",
+    )
     p.add_argument("--rank", type=int, default=16)
     p.add_argument("--alpha", type=int, default=16)
     p.add_argument("--temperature", type=float, default=1.0,
@@ -370,6 +427,13 @@ def parse_args() -> argparse.Namespace:
         help="weight on step-recall partial credit for WRONG completions "
              "(0 disables). Must stay below 1 so a wrong answer can never "
              "outscore a right one.",
+    )
+    p.add_argument(
+        "--probe", type=int, default=0, metavar="N",
+        help="generate and grade N groups, report the reward spread, and stop "
+             "without training. Answers the one question the offline tests "
+             "cannot: whether REAL rollouts differ from each other enough to "
+             "carry a gradient. Cheap next to finding out an hour into a run.",
     )
     p.add_argument(
         "--smoke", action="store_true",
@@ -476,11 +540,28 @@ def main() -> None:
         [p for p in model.parameters() if p.requires_grad], lr=args.lr
     )
 
+    # Adam's moments are part of the run's state, not scratch. A session that
+    # resumes without them restarts the optimiser cold - the first few steps
+    # after every preemption take badly scaled updates, and on a run that only
+    # fits in a Colab session three times over, that is most of the run.
+    opt_state = args.output / "optimizer.pt"
+    if resumed and opt_state.exists():
+        try:
+            opt.load_state_dict(torch.load(opt_state, map_location=device))
+            print(f"resumed optimiser state from {opt_state}")
+        except Exception as e:  # a corrupt half-written file must not end the run
+            print(f"warning: could not load {opt_state} ({e}); "
+                  "continuing with a fresh optimiser", file=sys.stderr)
+    elif resumed:
+        print("note: no optimizer.pt beside the adapter - this resumes the "
+              "weights but restarts Adam cold")
+
     gens = args.generations
     attempts = 0      # prompts tried
     trained = 0       # prompts that actually produced a gradient
     seen_texts: list[str] = []
-    seen_groups: list[list[bool]] = []
+    seen_groups: list[list[float]] = []
+    seen_right: list[int] = []
     g = torch.Generator(device="cpu").manual_seed(args.seed)
 
     # --steps counts GRADIENT steps, not prompts tried. A unanimous group costs
@@ -490,7 +571,8 @@ def main() -> None:
     # rather than uncertain, so re-drawing it buys the same nothing again.
     step = 0
     retired: set[int] = set()
-    max_attempts = args.steps * args.attempts_per_step
+    probed: list[tuple[str, int, list[float]]] = []
+    max_attempts = args.probe if args.probe else args.steps * args.attempts_per_step
     while trained < args.steps and attempts < max_attempts:
         live = [i for i in range(len(rows)) if i not in retired]
         if not live:
@@ -555,18 +637,22 @@ def main() -> None:
         # --- reward ------------------------------------------------------------
         verdicts = grade(args.grader, [(t, row) for t in texts])
         rewards = shaped_rewards(verdicts, args.shaping)
-        advantages = group_advantages(rewards)
+        advantages = group_advantages(rewards, min_spread=args.min_spread)
         n_right = sum(1 for ok, _ in verdicts if ok)
 
         if len(seen_groups) < 10:
             seen_texts += texts
             seen_groups.append(rewards)
+            seen_right.append(n_right)
             if len(seen_groups) == 10:
-                msg = reward_health(seen_texts, seen_groups, args.max_new)
+                msg = reward_health(seen_texts, seen_groups, args.max_new,
+                                    args.min_spread, seen_right)
                 dead = msg.startswith("***")
                 print(f"\n{msg}\n",
                       file=sys.stderr if dead else sys.stdout, flush=True)
-                if dead and args.abort_if_flat:
+                # Not during a probe: its whole job is to report, and exiting
+                # here would suppress the summary that says what to change.
+                if dead and args.abort_if_flat and not args.probe:
                     # Ten unanimous groups means the remaining steps would train on
                     # a zero gradient. Unattended, that silently spends the whole
                     # session; stopping here leaves the reason on screen and the
@@ -588,9 +674,18 @@ def main() -> None:
             print(f"\n--smoke: forcing one backward with synthetic advantages "
                   f"{advantages} (not learning - testing the machinery)", flush=True)
 
+        attempts += 1
+
+        # --probe: record and move on. No backward, no optimiser, nothing saved.
+        if args.probe:
+            lo, hi = min(rewards), max(rewards)
+            probed.append((row["id"], n_right, rewards))
+            print(f" {n_right}/{len(rewards)} right, reward {lo:.3f}..{hi:.3f} "
+                  f"(spread {hi - lo:.3f})  [{attempts}/{args.probe}]", flush=True)
+            continue
+
         # A flat group carries no information; skip the backward pass entirely
         # rather than spending it on a zero gradient.
-        attempts += 1
         if all(a == 0.0 for a in advantages):
             retired.add(idx)
             print(f" {n_right}/{len(verdicts)} right, reward "
@@ -660,12 +755,43 @@ def main() -> None:
         if args.save_every and trained % args.save_every == 0:
             args.output.mkdir(parents=True, exist_ok=True)
             model.save_pretrained(str(args.output))
+            torch.save(opt.state_dict(), opt_state)
             print(f"  checkpoint -> {args.output}", flush=True)
+
+    if args.probe:
+        # The question this answers: do real rollouts differ from each other?
+        # Every offline test used completions I wrote by hand, which are
+        # guaranteed to differ. Nothing before this point proves the model
+        # produces spread on its own.
+        n = len(probed)
+        trainable = sum(1 for _, _, r in probed if max(r) - min(r) >= args.min_spread)
+        split = sum(1 for _, k, r in probed if 0 < k < len(r))
+        ranked = sum(1 for _, k, r in probed
+                     if k == 0 and max(r) - min(r) >= args.min_spread)
+        flat = n - trainable
+        print(f"\n--- probe: {n} groups, no training ---")
+        print(f"  would carry a gradient : {trainable}/{n}  ({trainable/max(n,1):.0%})")
+        print(f"    of which correct/wrong splits : {split}")
+        print(f"    of which all-wrong, ranked by partial credit : {ranked}")
+        print(f"  flat (spread < {args.min_spread}) : {flat}")
+        if trainable / max(n, 1) < 0.3:
+            print("\n*** under a third would train. A real run would abort at step "
+                  "10, and should. Do not start it.")
+        elif split == 0:
+            print("\n*** nothing was ever answered correctly. Partial credit will "
+                  "train it toward reaching intermediates and never toward "
+                  "finishing. Mix in an easier difficulty first.")
+        else:
+            print(f"\nlooks workable: {trainable}/{n} groups carry a gradient and "
+                  f"{split} of them contain a correct answer to learn from.")
+        return
 
     args.output.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(str(args.output))
+    torch.save(opt.state_dict(), opt_state)
     tok.save_pretrained(str(args.output))
-    print(f"\nsaved GRPO adapter to {args.output}")
+    print(f"\nsaved GRPO adapter to {args.output} "
+          f"({trained} gradient steps this session, {attempts} prompts tried)")
 
 
 if __name__ == "__main__":

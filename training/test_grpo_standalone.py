@@ -180,4 +180,42 @@ assert shaped_rewards([(False, None), (True, None)], 0.25) == [0.0, 1.0]
 assert shaped_rewards([(False, 1.0), (True, 1.0)], 0.0) == [0.0, 1.0], "--shaping 0 is binary"
 print("no anchors, or --shaping 0 -> plain binary reward")
 
+# ------------------------------------------------------------- min-spread ---
+
+# Shaping reintroduced the exact problem the epsilon floor exists to stop.
+# Normalisation is scale-free, so eight wrong rollouts differing by one anchor
+# out of twelve - about 0.02 of reward - become full-sized advantages, and the
+# model would train as hard on one accidental number as on getting it right.
+hairline = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.021]
+amplified = group_advantages(hairline)
+assert max(amplified) > 2.0, f"normalisation really does amplify: {amplified}"
+assert group_advantages(hairline, min_spread=0.05) == [0.0] * 8
+print(f"one-anchor spread: {max(amplified):+.2f} normalised -> 0.00 with a floor")
+
+# And the floor must never touch the binary signal, which is the whole point of
+# choosing it below the gap between a wrong answer and a right one.
+assert max(shaped_rewards([(False, 1.0)], 0.25)) == 0.25, "best possible wrong"
+assert 1.0 - 0.25 > 0.05, "a correct/incorrect split is far above the floor"
+split = shaped_rewards([(True, 1.0)] * 3 + [(False, 1.0)] * 5, 0.25)
+assert min(group_advantages(split, min_spread=0.05)) < 0, (
+    f"a correct/incorrect split must still train: {split}"
+)
+print("correct/incorrect splits are unaffected by the floor")
+
+# reward_health must use the SAME floor, or it reports gradient the trainer then
+# declines to take - which is how a run spends a night on nothing.
+msg = reward_health([DONE] * 80, [hairline] * 10, 8192, min_spread=0.05)
+assert msg.startswith("***"), f"hairline spread is not health: {msg}"
+print("reward_health applies the same floor")
+
+# A run where nothing is ever right will train toward reaching intermediates and
+# never toward finishing. Worth stopping for, even though the gradient is real.
+ranked = [0.0, 0.05, 0.10, 0.15, 0.20, 0.25, 0.10, 0.05]
+msg = reward_health([DONE] * 80, [ranked] * 10, 8192, 0.05, [0] * 10)
+assert msg.startswith("***") and "entirely wrong" in msg, msg
+msg = reward_health([DONE] * 80, [ranked] * 10, 8192, 0.05, [0] * 9 + [3])
+assert not msg.startswith("***"), f"one group with a correct answer is enough: {msg}"
+assert "correct/incorrect split" in msg, msg
+print("all-wrong-forever aborts; one correct answer is enough to proceed")
+
 print("\nall GRPO maths verified - no GPU, no model, no framework")
