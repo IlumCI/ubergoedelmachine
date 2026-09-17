@@ -205,11 +205,25 @@ def reward_health(texts: list[str], groups: list[list[bool]], budget: int) -> st
     """
     answered = sum(1 for t in texts if "answer:" in t.lower()) / max(len(texts), 1)
     mixed = sum(1 for g in groups if len(set(g)) > 1)
-    if mixed:
+    rate = mixed / max(len(groups), 1)
+    # A THIRD, not one. `if mixed:` passed a run where 1 group in 10 had spread,
+    # and it went on to spend five hours producing a single gradient step -
+    # every other step skipped as unanimous. Spread has to be common enough that
+    # most rollout compute buys a gradient, or the run is mostly a generator.
+    if rate >= 0.3:
         return (
             f"reward health: {mixed}/{len(groups)} opening groups had spread, "
             f"{answered:.0%} of rollouts finished with an answer. Training has "
             "something to learn from."
+        )
+    if mixed and answered >= 0.5:
+        return (
+            f"*** almost no gradient: only {mixed}/{len(groups)} groups had spread, "
+            f"and {answered:.0%} of rollouts finished. The problems are mostly "
+            "SOLVED-OR-DOOMED rather than uncertain - 8 rollouts on an easy item "
+            "give 8 correct, on a hard one 8 wrong, and neither teaches anything. "
+            "Mix in harder DIFFICULTY, or select problems that actually produce "
+            "spread."
         )
     if answered < 0.5:
         return (
@@ -287,6 +301,10 @@ def parse_args() -> argparse.Namespace:
                    help="stop when the opening groups carry no gradient, rather than "
                         "spending the rest of the run on a zero signal")
     p.add_argument("--no-abort-if-flat", dest="abort_if_flat", action="store_false")
+    p.add_argument("--attempts-per-step", type=int, default=6,
+                   help="how many prompts may be tried per gradient step before "
+                        "giving up. A unanimous group teaches nothing but costs "
+                        "the same rollouts, so this bounds the waste")
     p.add_argument("--min-generations", type=int, default=2,
                    help="on CUDA OOM the group is halved and retried, down to this; "
                         "a smaller group still teaches something, a dead run does not")
@@ -375,12 +393,29 @@ def main() -> None:
     )
 
     gens = args.generations
+    attempts = 0      # prompts tried
+    trained = 0       # prompts that actually produced a gradient
     seen_texts: list[str] = []
     seen_groups: list[list[bool]] = []
     g = torch.Generator(device="cpu").manual_seed(args.seed)
 
-    for step in range(args.steps):
-        row = rows[int(torch.randint(len(rows), (1,), generator=g).item())]
+    # --steps counts GRADIENT steps, not prompts tried. A unanimous group costs
+    # the same rollouts and teaches nothing, so letting it consume a step is how
+    # a 40-step run produced one update. Problems that come back unanimous are
+    # also retired: on this curriculum a prompt is usually solved-or-doomed
+    # rather than uncertain, so re-drawing it buys the same nothing again.
+    step = 0
+    retired: set[int] = set()
+    max_attempts = args.steps * args.attempts_per_step
+    while trained < args.steps and attempts < max_attempts:
+        live = [i for i in range(len(rows)) if i not in retired]
+        if not live:
+            print("every problem has come back unanimous at least once; "
+                  "reopening the pool", flush=True)
+            retired.clear()
+            live = list(range(len(rows)))
+        idx = live[int(torch.randint(len(live), (1,), generator=g).item())]
+        row = rows[idx]
         chat = [
             {"role": "system", "content": REASONING_SYSTEM},
             {"role": "user", "content": row["question"]},
@@ -459,10 +494,15 @@ def main() -> None:
 
         # A flat group carries no information; skip the backward pass entirely
         # rather than spending it on a zero gradient.
+        attempts += 1
         if all(a == 0.0 for a in advantages):
-            print(f" reward {sum(rewards)/len(rewards):.2f} (unanimous - "
-                  "no gradient, skipped)", flush=True)
+            retired.add(idx)
+            print(f" reward {sum(rewards)/len(rewards):.2f} (unanimous - no "
+                  f"gradient; {trained}/{args.steps} trained, "
+                  f"{attempts}/{max_attempts} tried)", flush=True)
             continue
+        trained += 1
+        step = trained - 1
 
         # --- policy gradient ---------------------------------------------------
         model.train()
@@ -499,7 +539,7 @@ def main() -> None:
               f"adv {min(advantages):+.2f}..{max(advantages):+.2f}  "
               f"[{time.time()-t_gen:.0f}s]", flush=True)
 
-        if args.save_every and (step + 1) % args.save_every == 0:
+        if args.save_every and trained % args.save_every == 0:
             args.output.mkdir(parents=True, exist_ok=True)
             model.save_pretrained(str(args.output))
             print(f"  checkpoint -> {args.output}", flush=True)

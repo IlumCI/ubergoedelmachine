@@ -124,6 +124,18 @@ assert msg.startswith("***") and "DIFFICULTY" in msg and "CUT OFF" not in msg, m
 # Pooling would call this mixed; per-group counting correctly calls it dead.
 msg = reward_health([DONE] * 80, [[True] * 8] * 5 + [[False] * 8] * 5, 8192)
 assert msg.startswith("***"), f"pooled spread masked ten flat groups: {msg}"
+# The case that cost a five-hour run: ONE mixed group in ten passed as healthy,
+# so the abort never fired and 39 of 40 steps trained on nothing.
+msg = reward_health([DONE] * 80, [[True, False]] + [[True] * 8] * 6 + [[False] * 8] * 3, 8192)
+assert msg.startswith("***"), f"1-in-10 spread must not pass as healthy: {msg}"
+assert "SOLVED-OR-DOOMED" in msg, msg
+print("1/10 mixed -> aborts (this is what silently passed before)")
+
+# A third is the line: enough that most rollout budget buys a gradient.
+msg = reward_health([DONE] * 80, [[True, False]] * 3 + [[True] * 8] * 7, 8192)
+assert not msg.startswith("***"), f"3-in-10 should be workable: {msg}"
+print("3/10 mixed -> proceeds")
+
 print("reward_health separates truncation from difficulty, and counts per group")
 
 print("\nall GRPO maths verified - no GPU, no model, no framework")
