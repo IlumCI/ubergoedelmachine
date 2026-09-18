@@ -65,13 +65,28 @@ def parse_args() -> argparse.Namespace:
 
 
 def versions() -> dict:
-    out = {}
-    for mod in ("torch", "transformers", "peft", "vllm"):
-        try:
-            out[mod] = __import__(mod).__version__
-        except Exception as e:                       # noqa: BLE001
-            out[mod] = f"absent ({type(e).__name__})"
-    return out
+    """Versions as a FRESH process sees them, not as this one does.
+
+    Importing in-process is wrong here and quietly so: a module already imported
+    before the pip install keeps its old `__version__` in `sys.modules`, so the
+    check reports "unchanged" while the installed version on disk is different.
+    That is exactly how this file first reported torch 2.11 surviving a vLLM
+    install that had in fact pulled it down to 2.10 - the answer it exists to
+    give, given wrong, which is worse than not asking.
+    """
+    code = (
+        "import json,importlib\n"
+        "o={}\n"
+        "for m in ('torch','transformers','peft','vllm'):\n"
+        "    try: o[m]=importlib.import_module(m).__version__\n"
+        "    except Exception as e: o[m]=f'absent ({type(e).__name__})'\n"
+        "print(json.dumps(o))"
+    )
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    try:
+        return json.loads(r.stdout.strip().splitlines()[-1])
+    except Exception:                                # noqa: BLE001
+        return {"error": (r.stderr or r.stdout)[-200:]}
 
 
 def main() -> None:
