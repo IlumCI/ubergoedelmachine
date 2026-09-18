@@ -37,7 +37,13 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    p.add_argument("--adapter", type=Path, required=True, help="a TRAINED adapter")
+    p.add_argument(
+        "--adapter", type=Path, default=None,
+        help="a trained adapter. Omit to build a synthetic one instead - the "
+             "swap mechanism does not care whether the weights learned anything, "
+             "only that they are not zero, and a synthetic adapter needs no "
+             "Drive and no prior run.",
+    )
     p.add_argument("--base-model", default="Qwen/Qwen3-4B-Thinking-2507")
     p.add_argument("--work", type=Path, default=Path("/content/lora-swap"))
     p.add_argument("--max-tokens", type=int, default=64)
@@ -64,18 +70,50 @@ def zero_lora_b(src: Path, dst: Path) -> int:
     return n
 
 
+def synthesise(base_model: str, dst: Path) -> Path:
+    """Build a LoRA with NON-ZERO B, so it demonstrably changes the output.
+
+    peft initialises B to zero, which is right for training and useless here: a
+    zero-B adapter is the identity, so it could not tell "the swap worked" from
+    "the adapter was ignored". Filling B with noise makes the effect loud and
+    unmistakable, which is what a mechanism test wants.
+    """
+    import torch
+    from peft import LoraConfig, get_peft_model
+    from transformers import AutoModelForCausalLM
+
+    print(f"no --adapter given; synthesising one from {base_model}", flush=True)
+    m = AutoModelForCausalLM.from_pretrained(base_model, dtype=torch.bfloat16)
+    m = get_peft_model(m, LoraConfig(
+        r=16, lora_alpha=16, lora_dropout=0.0, bias="none", task_type="CAUSAL_LM",
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                        "gate_proj", "up_proj", "down_proj"]))
+    with torch.no_grad():
+        for n, p in m.named_parameters():
+            if "lora_B" in n:
+                p.normal_(0.0, 0.02)
+    dst.mkdir(parents=True, exist_ok=True)
+    m.save_pretrained(str(dst))
+    del m
+    torch.cuda.empty_cache()
+    return dst
+
+
 def main() -> None:
     args = parse_args()
-    if not (args.adapter / "adapter_model.safetensors").exists():
-        sys.exit(f"no adapter_model.safetensors in {args.adapter}")
+    shutil.rmtree(args.work, ignore_errors=True)
+    src = args.adapter
+    if src is None:
+        src = synthesise(args.base_model, args.work / "synth")
+    if not (src / "adapter_model.safetensors").exists():
+        sys.exit(f"no adapter_model.safetensors in {src}")
 
     real, zeroed = args.work / "real", args.work / "zeroed"
-    shutil.rmtree(args.work, ignore_errors=True)
-    real.mkdir(parents=True)
-    for f in args.adapter.iterdir():
+    real.mkdir(parents=True, exist_ok=True)
+    for f in src.iterdir():
         if f.is_file():
             shutil.copy(f, real / f.name)
-    n = zero_lora_b(args.adapter, zeroed)
+    n = zero_lora_b(src, zeroed)
     print(f"built two adapters: real, and one with {n} lora_B tensors zeroed")
 
     from vllm import LLM, SamplingParams
