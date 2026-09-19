@@ -150,9 +150,14 @@ def main() -> None:
     sp = SamplingParams(temperature=0.0, max_tokens=args.max_tokens)
     prompt = "Compute 17 * 23 step by step, showing every intermediate value."
 
+    # enforce_eager: skip torch.compile and CUDA-graph capture entirely. With
+    # LoRA enabled vLLM specialises graphs per capture size, and on a cold
+    # inductor cache that cold start ran past 38 minutes without reaching the
+    # first token. This test does five short greedy generations to check swap
+    # SEMANTICS - compilation buys it nothing and costs it everything.
     llm = LLM(model=args.base_model, dtype="bfloat16",
               gpu_memory_utilization=args.gpu_frac, max_model_len=2048,
-              enable_lora=True, max_lora_rank=32)
+              enable_lora=True, max_lora_rank=32, enforce_eager=True)
 
     def gen(lora=None):
         out = llm.generate([prompt], sp, **({"lora_request": lora} if lora else {}))
